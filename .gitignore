@@ -1,0 +1,23 @@
+# Never commit credentials or anything session-bearing.
+.env
+*.env
+secrets/
+*.token
+storage_state*.json
+browser-profile/
+cookies*.json
+
+# Local environment
+.venv/
+__pycache__/
+*.py[cod]
+
+# Pulled data, not source. Today these hold assignment titles and dates; once
+# per-student overrides are in scope a row can name an individual student, which
+# is FERPA data -- and this repo is public. A test fixture needs `git add -f`.
+*.csv
+
+# Debug artifacts from failed runs (screenshots may contain course/roster data)
+snapshots/
+*.png
+*.html
