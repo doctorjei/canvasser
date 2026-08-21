@@ -21,12 +21,19 @@ retarget a write.
 from __future__ import annotations
 
 import csv
+import re
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
 #: Written into every file so a later `push` can reject a sheet it does not
 #: understand instead of misreading columns that moved.
 SCHEMA_VERSION = "2"
+
+#: The header comment also records the course the sheet came from. Without it,
+#: nothing stops a sheet pulled from one section being pushed into another --
+#: the assignment ids simply would not match, and "no rows matched" is a far
+#: worse failure than "this sheet belongs to a different course".
+HEADER = re.compile(r"#\s*canvasser datesheet v(?P<version>\S+)(?:\s+course=(?P<course>\d+))?")
 
 EDITABLE_COLUMNS = ("due_at",)
 
@@ -53,7 +60,9 @@ class AssignmentRow:
 COLUMNS = tuple(f.name for f in fields(AssignmentRow))
 
 
-def write_sheet(rows: list[AssignmentRow], path: Path) -> Path:
+def write_sheet(
+    rows: list[AssignmentRow], path: Path, course_id: str | None = None
+) -> Path:
     """Write the CSV, newest pull wins.
 
     `newline=""` is required by the csv module on every platform; without it you
@@ -61,7 +70,10 @@ def write_sheet(rows: list[AssignmentRow], path: Path) -> Path:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
-        handle.write(f"# canvasser datesheet v{SCHEMA_VERSION}\n")
+        stamp = f"# canvasser datesheet v{SCHEMA_VERSION}"
+        if course_id:
+            stamp += f" course={course_id}"
+        handle.write(stamp + "\n")
         writer = csv.DictWriter(handle, fieldnames=COLUMNS)
         writer.writeheader()
         for row in rows:
@@ -69,10 +81,33 @@ def write_sheet(rows: list[AssignmentRow], path: Path) -> Path:
     return path
 
 
-def read_sheet(path: Path) -> list[AssignmentRow]:
+@dataclass(frozen=True)
+class Sheet:
+    """A parsed datesheet: its rows plus where they came from."""
+
+    rows: list[AssignmentRow]
+    course_id: str | None
+    version: str | None
+    path: Path
+
+    def by_key(self) -> dict[tuple[str, str], AssignmentRow]:
+        return {row.key: row for row in self.rows}
+
+
+def read_sheet(path: Path) -> Sheet:
     """Read a CSV back, tolerating the comment line and spreadsheet re-saves."""
     with path.open(newline="", encoding="utf-8-sig") as handle:
-        lines = [line for line in handle if not line.startswith("#")]
+        raw = handle.readlines()
+
+    course_id = version = None
+    for line in raw:
+        found = HEADER.match(line.strip())
+        if found:
+            version = found.group("version")
+            course_id = found.group("course")
+            break
+
+    lines = [line for line in raw if not line.lstrip().startswith("#")]
 
     rows: list[AssignmentRow] = []
     for record in csv.DictReader(lines):
@@ -99,7 +134,12 @@ def read_sheet(path: Path) -> list[AssignmentRow]:
             f"(assignment_id, override_id) must appear once -- otherwise push "
             f"cannot tell which row wins."
         )
-    return rows
+    if version and version != SCHEMA_VERSION:
+        raise ValueError(
+            f"{path} is datesheet v{version}; this build writes and reads "
+            f"v{SCHEMA_VERSION}. Re-run `canvasser pull` to regenerate it."
+        )
+    return Sheet(rows=rows, course_id=course_id, version=version, path=path)
 
 
 def _duplicate_keys(rows: list[AssignmentRow]) -> list[tuple[str, str]]:

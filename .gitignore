@@ -16,6 +16,8 @@ __pycache__/
 # per-student overrides are in scope a row can name an individual student, which
 # is FERPA data -- and this repo is public. A test fixture needs `git add -f`.
 *.csv
+# Rendered terminal previews -- same category: real course names and ids.
+*.ans
 
 # Debug artifacts from failed runs (screenshots may contain course/roster data)
 snapshots/
