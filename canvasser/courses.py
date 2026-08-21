@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from playwright.sync_api import Page
 
@@ -73,21 +73,74 @@ class Course:
         return needle in self.name.lower() or needle in self.term.lower()
 
 
-def _cell_texts(row) -> list[str]:
-    cells = row.locator("td")
-    return [(cells.nth(i).inner_text() or "").strip() for i in range(cells.count())]
+@dataclass(frozen=True)
+class Scope:
+    """The three independent scope axes, as the user set them.
+
+    Kept as a value object rather than loose kwargs because the name search
+    *relaxes* scope one axis at a time and has to report which axis it widened.
+    Booleans mirror the flags: `active`/`archived` are "only that"; both false
+    means both. Favourite is the one winnowed default, so its flag opens it up.
+    """
+
+    active: bool = False
+    archived: bool = False
+    published: bool = False
+    unpublished: bool = False
+    include_non_favorites: bool = False
+
+    # Each axis reports whether it is already as wide as it goes, so the search
+    # can skip a relaxation that would re-search an identical set.
+    @property
+    def publish_is_widest(self) -> bool:
+        return not self.published and not self.unpublished
+
+    @property
+    def enrollment_is_widest(self) -> bool:
+        return not self.active and not self.archived
+
+    @property
+    def favorites_is_widest(self) -> bool:
+        return self.include_non_favorites
+
+    @property
+    def is_widest(self) -> bool:
+        return (
+            self.publish_is_widest
+            and self.enrollment_is_widest
+            and self.favorites_is_widest
+        )
+
+    def relax_publish(self) -> Scope:
+        return replace(self, published=False, unpublished=False)
+
+    def relax_enrollment(self) -> Scope:
+        return replace(self, active=False, archived=False)
+
+    def relax_favorites(self) -> Scope:
+        return replace(self, include_non_favorites=True)
+
+    def describe(self) -> str:
+        """Human-readable scope, for the expansion notice."""
+        parts = []
+        if self.active:
+            parts.append("current enrollments")
+        elif self.archived:
+            parts.append("past enrollments")
+        else:
+            parts.append("all enrollments")
+        if self.published:
+            parts.append("published only")
+        elif self.unpublished:
+            parts.append("unpublished only")
+        parts.append(
+            "all courses" if self.include_non_favorites else "favorites only"
+        )
+        return ", ".join(parts)
 
 
-def list_courses(
-    page: Page,
-    config: Config,
-    active: bool = False,
-    archived: bool = False,
-    include_non_favorites: bool = False,
-    published: bool = False,
-    unpublished: bool = False,
-) -> list[Course]:
-    """Return courses, filtered on three independent axes.
+def apply_scope(courses: list[Course], scope: Scope) -> list[Course]:
+    """Filter a fetched course list down to a scope. Pure -- no page access.
 
     Each axis has its own default, and only one of them is winnowed:
 
@@ -99,32 +152,43 @@ def list_courses(
     the user actually cares about right now, and it is a knob they already
     control from Canvas's own UI.
 
-    Everything is derived from the two /courses tables plus the star class. An
-    earlier version clicked the global-nav Courses flyout to get the "current"
-    set; that turned out to be exactly the set of starred courses, so the click
-    (and its async rendering) is no longer needed.
+    Separated from fetching so the name search can widen scope repeatedly
+    without re-visiting /courses; both tables come off a single page load.
+    """
+    if scope.active:
+        courses = [c for c in courses if not c.archived]
+    if scope.archived:
+        courses = [c for c in courses if c.archived]
+    if not scope.include_non_favorites:
+        courses = [c for c in courses if c.favorite]
+    if scope.published:
+        courses = [c for c in courses if c.published]
+    if scope.unpublished:
+        courses = [c for c in courses if not c.published]
+    return courses
+
+
+def fetch_courses(page: Page, config: Config) -> list[Course]:
+    """Every course on /courses, both tables, unfiltered.
+
+    One page load. Callers filter with `apply_scope`.
     """
     page.goto(f"{config.base_url}/courses", wait_until="domcontentloaded")
     quiesce(page)
 
     starred = _starred_ids(page)
-    courses: list[Course] = []
-    if not archived:
-        courses += _scrape_table(page, CURRENT_TABLE, archived=False, starred=starred)
-    if not active:
-        courses += _scrape_table(page, PAST_TABLE, archived=True, starred=starred)
+    courses = _scrape_table(page, CURRENT_TABLE, archived=False, starred=starred)
+    courses += _scrape_table(page, PAST_TABLE, archived=True, starred=starred)
 
-    if not courses and not archived:
+    if not courses:
         snapshot = save_debug_snapshot(page, "courses-empty")
         raise RuntimeError(f"No course links found on /courses. Snapshot: {snapshot}")
-
-    if not include_non_favorites:
-        courses = [c for c in courses if c.favorite]
-    if published:
-        courses = [c for c in courses if c.published]
-    if unpublished:
-        courses = [c for c in courses if not c.published]
     return courses
+
+
+def _cell_texts(row) -> list[str]:
+    cells = row.locator("td")
+    return [(cells.nth(i).inner_text() or "").strip() for i in range(cells.count())]
 
 
 def _starred_ids(page: Page) -> set[str]:

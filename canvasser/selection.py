@@ -23,6 +23,7 @@ import os
 import sys
 from pathlib import Path
 
+from .courses import Scope, apply_scope
 from .credentials import ConfigError, _read_from_tty, tty_available
 
 COURSE_VAR = "CANVASSER_COURSE"
@@ -76,6 +77,101 @@ def match_courses(courses: list, value: str) -> list:
     return [c for c in courses if c.matches(value)]
 
 
+class AmbiguousCourse(CourseSelectionError):
+    """Several courses matched. Listing them and stopping is the whole point.
+
+    Distinct from a plain selection failure because the caller must not treat
+    it as "keep looking": a wider scope can only add more matches, and the user
+    asked to be shown the collision rather than have one silently picked.
+    """
+
+
+def search_course(
+    all_courses: list, value: str, scope: Scope
+) -> tuple[object, list[str]]:
+    """Resolve `value` to one course, widening scope only if it finds nothing.
+
+    Returns (course, notes) where `notes` describes any scope expansion, for
+    the caller to report *before* it acts on the result.
+
+    Two rules from the user, in order:
+
+    1. **An exact course id always wins, at any scope.** Being told that
+       574855 does not exist because it happens to be unstarred is absurd, and
+       ids are unique so this can never be ambiguous.
+    2. **A name searches the current scope first**, and only widens when that
+       finds nothing -- publish state, then enrollment, then favourites. Each
+       widening is cumulative and is reported.
+
+    Ambiguity terminates at whatever scope produced it. Widening past a
+    collision would only grow it, and picking one would be a guess about which
+    real class to touch.
+    """
+    value = value.strip()
+
+    # Rule 1, before any scope reasoning: ids are exact and unique.
+    exact = [c for c in all_courses if c.id == value]
+    if exact:
+        course = exact[0]
+        in_scope = any(c.id == course.id for c in apply_scope(all_courses, scope))
+        notes = (
+            []
+            if in_scope
+            else [f"course id {course.id} is outside the current scope "
+                  f"({scope.describe()}); matched it anyway"]
+        )
+        return course, notes
+
+    # Rule 2: widen one axis at a time, in the user's stated order.
+    ladder: list[tuple[Scope, str | None]] = [(scope, None)]
+    current = scope
+    for relax, label in (
+        (Scope.relax_publish, "publish state"),
+        (Scope.relax_enrollment, "enrollment (current and past)"),
+        (Scope.relax_favorites, "favorites (now including unstarred courses)"),
+    ):
+        widened = relax(current)
+        # Skip an axis that was already wide open -- re-searching an identical
+        # set would report an "expansion" that changed nothing.
+        if widened != current:
+            ladder.append((widened, label))
+            current = widened
+
+    widened_by: list[str] = []
+    for step_scope, label in ladder:
+        if label is not None:
+            widened_by.append(label)
+        matches = match_courses(apply_scope(all_courses, step_scope), value)
+
+        if len(matches) == 1:
+            notes = []
+            if widened_by:
+                notes.append(
+                    f"no match in the current scope ({scope.describe()}); "
+                    f"widened {' then '.join(widened_by)}"
+                )
+            return matches[0], notes
+
+        if len(matches) > 1:
+            where = (
+                "the current scope"
+                if not widened_by
+                else f"scope widened by {' then '.join(widened_by)}"
+            )
+            listed = "\n".join(f"    {describe(c)}" for c in matches[:10])
+            more = "" if len(matches) <= 10 else f"\n    ... and {len(matches) - 10} more"
+            raise AmbiguousCourse(
+                f"{len(matches)} courses match {value!r} in {where}.\n"
+                f"Name a course id, or narrow the text:\n{listed}{more}"
+            )
+
+    raise CourseSelectionError(
+        f"No course matches {value!r}, at any scope -- the search widened from "
+        f"{scope.describe()} all the way out to every course on the account.\n"
+        f"Run `canvasser courses --all` to see them, or use a course id."
+    )
+
+
 def describe(course) -> str:
     flag = "" if course.published else "  (unpublished)"
     return f"{course.id}  {course.term}  {course.name}{flag}"
@@ -126,13 +222,21 @@ def choose_interactively(courses: list) -> object:
 
 
 def select_course(
-    courses: list,
+    all_courses: list,
     *,
     course: str | None = None,
     course_file: Path | None = None,
+    scope: Scope | None = None,
     allow_prompt: bool = True,
-) -> tuple[object, str]:
-    """Resolve to exactly one course. Returns (course, source)."""
+) -> tuple[object, str, list[str]]:
+    """Resolve to exactly one course. Returns (course, source, notes).
+
+    `all_courses` is the *unfiltered* list; scope is applied here rather than
+    by the caller, because the search has to be able to widen it. The
+    interactive picker still sees only the scoped set -- narrowing is the
+    entire point of a picker.
+    """
+    scope = scope or Scope()
     resolved = resolve_course_value(course=course, course_file=course_file)
 
     if resolved is None:
@@ -140,22 +244,13 @@ def select_course(
             raise CourseSelectionError(
                 "No course specified and prompting is disabled (--no-prompt)."
             )
-        return choose_interactively(courses), "prompt"
+        return choose_interactively(apply_scope(all_courses, scope)), "prompt", []
 
     value, source = resolved
-    matches = match_courses(courses, value)
-
-    if not matches:
-        raise CourseSelectionError(
-            f"No current course matches {value!r} (from {source}).\n"
-            f"Run `canvasser courses` to list them, or `courses --archived` if it "
-            f"is a past enrollment."
-        )
-    if len(matches) > 1:
-        listed = "\n".join(f"    {describe(c)}" for c in matches[:10])
-        more = "" if len(matches) <= 10 else f"\n    ... and {len(matches) - 10} more"
-        raise CourseSelectionError(
-            f"{len(matches)} courses match {value!r} (from {source}). Be more "
-            f"specific, or use the id:\n{listed}{more}"
-        )
-    return matches[0], source
+    try:
+        course_obj, notes = search_course(all_courses, value, scope)
+    except CourseSelectionError as exc:
+        # Name the source so a stale $CANVASSER_COURSE or --course-file is
+        # obvious rather than looking like a bad argument.
+        raise type(exc)(f"{exc}\n(course requested via {source})") from None
+    return course_obj, source, notes

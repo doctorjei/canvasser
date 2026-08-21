@@ -21,14 +21,9 @@ from pathlib import Path
 from .auth import LoginError, ensure_logged_in, is_logged_in, quiesce
 from .browser import open_page
 from .assignments import pull_course
-from .courses import list_courses
+from .courses import Scope, apply_scope, fetch_courses
 from .datesheet import write_sheet
-from .selection import (
-    COURSE_VAR,
-    CourseSelectionError,
-    resolve_course_value,
-    select_course,
-)
+from .selection import COURSE_VAR, CourseSelectionError, select_course
 from .config import Config, ConfigError, ENV_FILE, load_config
 from .credentials import PASSWORD_VAR, USERNAME_VAR
 from .duo import APPROVERS, ApprovalError
@@ -74,7 +69,7 @@ def cmd_courses(args: argparse.Namespace) -> int:
     approver = APPROVERS[args.factor]()
     with open_page(headless=not args.headed) as page:
         ensure_logged_in(page, config, approver)
-        courses = list_courses(page, config, **scope_kwargs(args))
+        courses = apply_scope(fetch_courses(page, config), scope_from_args(args))
 
     if args.filter:
         courses = [c for c in courses if c.matches(args.filter)]
@@ -164,26 +159,22 @@ def cmd_pull(args: argparse.Namespace) -> int:
     with open_page(headless=not args.headed) as page:
         ensure_logged_in(page, config, approver)
 
-        # Scope governs *browsing*, not *explicit selection*. If the user named
-        # a course, search every course they have -- being told "no course
-        # matches 574855" because it happens to be unstarred is absurd, and it
-        # contradicts the rule that an exact id wins outright. The scope axes
-        # still shape the interactive picker, where narrowing is the point.
-        named = resolve_course_value(
-            course=args.course,
-            course_file=Path(args.course_file) if args.course_file else None,
-        )
-        courses = list_courses(
-            page,
-            config,
-            **({"include_non_favorites": True} if named else scope_kwargs(args)),
-        )
-        course, source = select_course(
+        # Scope governs *browsing*, not *explicit selection*. Fetch everything
+        # once; `select_course` applies scope itself and widens it if a name
+        # finds nothing there. Both /courses tables come off one page load, so
+        # widening costs no extra navigation.
+        courses = fetch_courses(page, config)
+        course, source, notes = select_course(
             courses,
             course=args.course,
             course_file=Path(args.course_file) if args.course_file else None,
+            scope=scope_from_args(args),
             allow_prompt=not args.no_prompt,
         )
+        # Report an expansion *before* acting on the result -- the user asked
+        # to know they are getting a course from outside what they asked for.
+        for note in notes:
+            print(f"  Note: {note}", file=sys.stderr)
         print(f"  Course: {course.id}  {course.name}  (from {source})", file=sys.stderr)
 
         rows = pull_course(page, config, course.id, limit=args.limit)
@@ -239,14 +230,14 @@ def add_scope_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def scope_kwargs(args: argparse.Namespace) -> dict:
-    return {
-        "active": args.active,
-        "archived": args.archived,
-        "published": args.published,
-        "unpublished": args.unpublished,
-        "include_non_favorites": args.include_non_favorites,
-    }
+def scope_from_args(args: argparse.Namespace) -> Scope:
+    return Scope(
+        active=args.active,
+        archived=args.archived,
+        published=args.published,
+        unpublished=args.unpublished,
+        include_non_favorites=args.include_non_favorites,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
