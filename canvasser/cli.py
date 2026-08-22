@@ -1,9 +1,13 @@
 """Command-line entry point.
 
-    canvasser status              # is the stored session still authenticated?
-    canvasser login               # authenticate (prompts Duo if needed)
-    canvasser courses --teaching  # list courses with their ids
-    canvasser pull <course_id>    # assignment due dates -> CSV
+    canvasser status               # is the stored session still authenticated?
+    canvasser login                # authenticate (prompts Duo if needed)
+    canvasser courses --teaching   # list courses with their ids
+    canvasser settings <course>    # details, sections, navigation
+    canvasser pull <course>        # assignment dates -> CSV
+    canvasser push <sheet.csv>     # what would change; writes nothing
+    canvasser push <sheet.csv> --commit    # write it, verifying each field
+    canvasser install-browser      # fetch Chromium (otherwise offered on first use)
 
 Credentials come from the first source that has them: --secrets-file, the
 environment, the default secrets file, then a prompt. There is no password flag

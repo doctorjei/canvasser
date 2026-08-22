@@ -1,35 +1,59 @@
 """Writing dates back into Canvas's assignment edit form.
 
-This is the only module that changes anything. Everything it does is shaped by
-two hazards found on the real form, both of which fail *silently* if ignored.
+This is the only module that changes anything. Everything in it is shaped by
+five hazards found on the real form. **Every one of them fails silently** --
+none throws, none navigates anywhere unusual, and four of the five produced a
+run that reported success while the dates were wrong or absent.
 
-## Hazard 1: the form speaks the USER's timezone, not the course's
+## 1. The form speaks the USER's timezone, not the course's
 
-Observed live: the course runs `America/New_York`, the user's Canvas profile is
-`Asia/Tokyo`, and the edit form renders `2026-02-01 23:59:59` course-time as
-`Feb 2, 2026` / `1:59 PM`. Typing a course-time value straight in would move
-every deadline by 14 hours, with nothing to notice.
+Observed live: the course runs `America/New_York`, the profile is `Asia/Tokyo`,
+and the form renders `2026-02-01 23:59:59` course-time as `Feb 2, 2026` /
+`1:59 PM`. Typing a course-time value straight in moves every deadline by 14
+hours. Values are converted to the profile zone before typing, and
+`ENV.TIMEZONE` *on the page being written* is the authority -- not a setting,
+not a guess. Changing the profile timezone to dodge this is not an option: it
+is global and would reinterpret every other course the user teaches.
 
-So every value is converted from the sheet's zone to the profile zone before it
-is typed, and `ENV.TIMEZONE` on the page itself is the authority for what the
-profile zone is -- not a guess, not a setting.
+## 2. Saving submits EVERY date card
 
-Changing the user's profile timezone to dodge this is not an option: it is
-global, and would silently reinterpret every other course they teach.
+The form posts all of its "Assign to" cards, not just the one touched.
+Rebuilding form state from a CSV would delete any override the sheet does not
+know about -- a student's accommodation date. So: **load the form and modify it
+in place, never construct it**, and **refuse outright to write an assignment
+that has overrides** until that path is built and tested somewhere it can be.
+A write that "probably works" is not good enough when the failure silently
+removes an accommodation.
 
-## Hazard 2: saving submits EVERY date card
+## 3. The form is not ready when it looks ready
 
-Canvas's edit form posts all of its "Assign to" cards on save, not just the one
-that was touched. Rebuilding form state from a CSV would therefore delete any
-override the sheet does not know about -- a student's accommodation date, for
-instance. Two rules follow:
+The submit button reads **"Loading..."** and is disabled until every async
+panel loads -- Turnitin's is slow -- and **the Assign-To card mounts after that
+button goes live**. A fixed 2.5s wait produced two failures: no Save button
+found, or the panel finishing *after* the dates were typed so React
+re-initialised the form and the save wrote the old values, looking healthy.
+`FORM_READY` requires both halves. Readiness is a state, never a duration.
 
-1. **Load the form and modify it in place.** Never construct its state.
-2. **Refuse outright to write an assignment that has overrides**, until the
-   multi-card path is built and tested against a course that actually has them.
-   The course this was developed on has none, so nothing here has ever
-   exercised that case, and a write that "probably works" is not good enough
-   when the failure silently removes a student's accommodation.
+## 4. Enter submits the form
+
+It commits the date picker only when the picker has focus. Otherwise it
+submits, which on 2026-08-22 saved two assignments *after* this code had
+decided not to save them -- the refusal refused nothing. Values commit via
+`Escape` then an explicit `blur()`.
+
+## 5. Canvas validates server-side and answers only on the page
+
+A rejected save is indistinguishable from a successful one. Confirmed rules, in
+Canvas's wording: `"Until date cannot be before due date"`, `"Due date cannot
+be before term start"`. `_FIELD_MESSAGES` reads them back, requiring *both*
+"still on /edit" and "messages present" -- a successful save navigates away,
+and InstUI renders hints through the same component as errors.
+
+## What follows from all five: verify three times
+
+Read the typed values back out of the DOM **before** saving; read Canvas's
+field messages **immediately after**; and re-read `ENV` **after that**. Each
+catches something the others cannot.
 """
 
 from __future__ import annotations

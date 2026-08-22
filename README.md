@@ -24,6 +24,7 @@ canvasser settings 580777             # course details, sections, navigation
 canvasser pull 580777                 # assignment dates -> CSV
 canvasser push dates-580777.csv       # show what would change; writes nothing
 canvasser push dates-580777.csv --commit   # actually write it
+canvasser install-browser             # fetch Chromium up front (usually automatic)
 ```
 
 `push` previews by default. Running it repeatedly while editing a sheet cannot touch the

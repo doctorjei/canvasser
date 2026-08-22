@@ -1,6 +1,6 @@
 """The CSV that carries assignment dates out to a spreadsheet and back.
 
-Scope (schema v3): **the three date fields Canvas puts on an assignment** --
+Scope (schema v3.1): **the three date fields Canvas puts on an assignment** --
 `unlock_at` ("Available from"), `due_at` ("Due"), and `lock_at` ("Until").
 Still no points, submission types, or grading settings.
 

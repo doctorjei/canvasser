@@ -29,6 +29,14 @@ conversion, not an error.
 
 The zone comes from `iana=` when present, and otherwise from the friendly
 `timezone=` label -- see `sheet_zone`.
+
+## What else this module refuses before a page is ever loaded
+
+`check_order` applies Canvas's own date-ordering rule to the *result* of the
+push -- the mixture of sheet values and whatever Canvas already holds. Canvas
+enforces it server-side and reports it only on the page, so catching it here
+saves an edit-page load per row for a save that cannot succeed, and names the
+cell to fix instead of reporting a bare mismatch afterwards.
 """
 
 from __future__ import annotations
