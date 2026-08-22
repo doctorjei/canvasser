@@ -35,9 +35,10 @@ classifiers = [
 
 # Playwright is the whole delivery mechanism, not an optional extra: this
 # program navigates Canvas as a person would because UF discontinued API token
-# support. Note that installing the library does NOT install the browser it
-# drives -- `playwright install chromium` is a separate step, and the first-run
-# error says so.
+# support. Installing the library does NOT install the browser it drives --
+# browser builds are platform-specific native binaries, so no PyPI package
+# carries them. canvasser offers to fetch Chromium on first use, and
+# `canvasser install-browser` does it up front.
 dependencies = ["playwright>=1.40"]
 
 [project.urls]

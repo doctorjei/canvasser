@@ -82,8 +82,10 @@ python3 -m venv .venv
 
 ### Where it keeps things
 
-The saved session, browser profile, and optional secrets file share one per-user directory —
-never the working directory, so nothing credential-bearing can be committed by accident:
+The saved session, browser profile, optional secrets file, and any debug snapshots share one
+per-user directory — never the working directory, so nothing credential-bearing can be
+committed by accident. (Snapshots render whole Canvas pages, so they can contain student
+data; the directory is created mode 700.)
 
 | | |
 |---|---|
