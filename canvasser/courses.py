@@ -13,7 +13,6 @@ id anywhere. Text is what a page shows; hrefs are what it means.)
 from __future__ import annotations
 
 import re
-import sys
 from dataclasses import dataclass, replace
 
 from playwright.sync_api import Page

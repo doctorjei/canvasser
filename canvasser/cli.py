@@ -18,12 +18,11 @@ runs. Run with -v to see which source was used (never the value itself).
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from pathlib import Path
 
 from . import __version__
-from .auth import LoginError, ensure_logged_in, is_logged_in, quiesce
+from .auth import LoginError, ensure_logged_in, is_logged_in
 from .browser import (
     DOWNLOAD_SIZE,
     BrowserUnavailable,

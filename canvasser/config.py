@@ -30,11 +30,8 @@ from pathlib import Path
 
 from .credentials import (
     ConfigError,
-    PASSWORD_VAR,
-    USERNAME_VAR,
     parse_env_file,
     resolve_credentials,
-    warn_if_world_readable,
 )
 
 __all__ = [
