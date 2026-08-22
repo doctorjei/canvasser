@@ -20,13 +20,20 @@ Comparison is on the **rendered strings**, not parsed instants, because that is
 what the round trip has to be stable in. `23:59` and `23:59:00` mean the same
 moment but are not the same cell, and a diff that called them equal would hide
 a real formatting drift in `pull`.
+
+That only works if both sides are in the same zone, which is what
+`align_timezone` guarantees before anything is compared: a sheet whose `iana=`
+differs from the course's zone is converted into course time first. `iana=`
+declares what the sheet's wall clocks *mean*, so a disagreement is a
+conversion, not an error.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from .datesheet import AssignmentRow, Sheet
+from .dateparse import convert
+from .datesheet import AssignmentRow, Sheet, SheetError
 
 #: The three date pairs, grouped for reporting. Canvas's field name first,
 #: because that is what the sheet's row 2 labels them and what a later write
@@ -189,35 +196,115 @@ def check_course(sheet: Sheet, course_id: str) -> None:
     sheet belongs elsewhere, because it looks like data loss.
     """
     if sheet.course_id and sheet.course_id != course_id:
-        raise ValueError(
+        raise SheetError(
             f"{sheet.path} was pulled from course {sheet.course_id}, but this "
             f"run targets {course_id}. Refusing: pushing a sheet into the wrong "
             f"course would write one class's dates onto another."
         )
 
 
-def check_timezone(sheet: Sheet, course_tz: str) -> None:
-    """Refuse a sheet whose zone no longer matches the course's.
+@dataclass(frozen=True)
+class Realignment:
+    """A record of converting a sheet's times into the course's zone."""
 
-    The sheet's times are bare wall clocks; `iana=` in its header is the only
-    thing that says what they mean. If the course's timezone has been changed
-    since the pull, every value in the file now denotes a *different instant*
-    than it did when written -- and nothing about the file looks wrong. A
-    course moved from New York to Los Angeles would silently shift every
-    deadline by three hours.
+    source: str      # the sheet's `iana=`
+    target: str      # the course's own zone
+    cells: int       # how many date/time pairs moved
+    example: str     # one of them, both ways round, for the user to sanity-check
 
-    Refusing is right rather than converting: which the user meant -- the same
-    wall clock in the new zone, or the same instant -- is a question only they
-    can answer, and quietly picking one would be a guess about real deadlines.
-    """
-    if sheet.iana and course_tz and sheet.iana != course_tz:
-        raise ValueError(
-            f"{sheet.path} records times in {sheet.iana}, but the course is now "
-            f"in {course_tz}. Every time in the sheet would mean a different "
-            f"instant than when it was pulled. Re-run `canvasser pull` to "
-            f"regenerate the sheet in the course's current timezone, then "
-            f"re-apply your edits."
+    def describe(self) -> str:
+        return (
+            f"Sheet times are in {self.source}; the course runs in "
+            f"{self.target}.\n"
+            f"  Converting {self.cells} time(s) to course time -- the instant "
+            f"is preserved, so the wall clock moves.\n"
+            f"  e.g. {self.example}"
         )
+
+
+def align_timezone(sheet: Sheet, course_tz: str) -> tuple[Sheet, Realignment | None]:
+    """Re-express a sheet's times in the course's zone, if they are not already.
+
+    `iana=` says what zone the sheet's wall clocks are written in -- nothing
+    more. It is not a claim about the course, so a disagreement is not an error
+    to refuse; it is a conversion to perform. A sheet edited in Tokyo saying
+    `12:59` and a course in New York holding `23:59` the previous day describe
+    the **same deadline**, and it is the instant a student is held to.
+
+    Everything downstream -- the diff, the write, and the post-write check --
+    then speaks course time, exactly as it does for a sheet pulled from this
+    course. Converting once here rather than at each of those three points is
+    what keeps them from disagreeing.
+
+    **A missing `iana=` means course time**, per the header contract: the sheet
+    was pulled in course time and the user deleted row 1. Nothing to convert.
+    """
+    if not (sheet.iana and course_tz) or sheet.iana == course_tz:
+        return sheet, None
+
+    unanchored: list[str] = []
+    rows: list[AssignmentRow] = []
+    cells = 0
+    example = ""
+
+    for row in sheet.rows:
+        moved: dict[str, str] = {}
+        for _, date_column, time_column in FIELD_PAIRS:
+            date = getattr(row, date_column)
+            time = getattr(row, time_column)
+            if not date:
+                # A time with no date has nothing to anchor it to a day, so
+                # there is no instant to convert. Left as it is; the write path
+                # refuses a field with no date anyway.
+                continue
+            if not time:
+                # Converting would have to assume a time, and a different
+                # assumed time lands on a different DATE -- the assumption
+                # would silently change the day the user typed.
+                unanchored.append(
+                    f"assignment {row.assignment_id} {date_column}={date}"
+                )
+                continue
+            where = f"{sheet.path.name}, assignment {row.assignment_id}, {date_column}"
+            new_date, new_time = convert(
+                date, time, sheet.iana, course_tz, where=where
+            )
+            moved[date_column] = new_date
+            moved[time_column] = new_time
+            cells += 1
+            if not example:
+                example = (
+                    f"{date} {time} {sheet.iana}  ->  "
+                    f"{new_date} {new_time} {course_tz}"
+                )
+        rows.append(replace(row, **moved) if moved else row)
+
+    if unanchored:
+        raise SheetError(
+            f"{sheet.path} records times in {sheet.iana} but the course runs "
+            f"in {course_tz}, so every time has to be converted -- and "
+            f"{len(unanchored)} cell(s) have a date with no time to convert: "
+            f"{', '.join(unanchored[:5])}"
+            + (f", and {len(unanchored) - 5} more" if len(unanchored) > 5 else "")
+            + ". Assuming a time would change the date itself. Fill the time "
+            "in, or set the sheet's `iana=` to the course's own zone if the "
+            "dates were already written in course time."
+        )
+
+    # The returned sheet is course-local, so it must say so: `iana` becomes the
+    # course's zone and the familiar label is dropped rather than left behind
+    # naming a zone the values are no longer in. **This holds even when nothing
+    # was convertible** -- "after align_timezone the sheet is in course time"
+    # is the one invariant the diff and the write path both rely on, and an
+    # invariant with an exception in it is not one.
+    aligned = replace(sheet, rows=rows, iana=course_tz, timezone=None)
+    if not cells:
+        # The zones differ but the sheet holds nothing to convert. Announcing
+        # "converting 0 times" with no example to show would be noise.
+        return aligned, None
+    return aligned, Realignment(
+        source=sheet.iana, target=course_tz, cells=cells, example=example,
+    )
 
 
 def describe_scope(sheet: Sheet) -> str:

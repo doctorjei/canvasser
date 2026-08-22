@@ -91,6 +91,15 @@ EDITABLE_COLUMNS = (
 )
 
 
+class SheetError(ValueError):
+    """A datesheet cannot be used as given, and the user must change something.
+
+    Distinct from a bare `ValueError` so the CLI can print the message plainly
+    instead of a traceback: every one of these is a sentence addressed to the
+    person editing the file, not a defect report.
+    """
+
+
 @dataclass(frozen=True)
 class AssignmentRow:
     """One assign-to target's dates.
@@ -259,7 +268,7 @@ def read_sheet(path: Path) -> Sheet:
         (i for i, record in enumerate(records) if "assignment_id" in record), None
     )
     if start is None:
-        raise ValueError(
+        raise SheetError(
             f"{path} has no column header row -- expected a line containing "
             f"'assignment_id'. Re-run `canvasser pull` to regenerate it."
         )
@@ -273,7 +282,7 @@ def read_sheet(path: Path) -> Sheet:
     # correctly here. Refusing it would force a nine-minute re-pull to fix a
     # difference that changes nothing.
     if version and _major(version) != _major(SCHEMA_VERSION):
-        raise ValueError(
+        raise SheetError(
             f"{path} is datesheet v{version}; this build writes and reads "
             f"v{SCHEMA_VERSION}. Re-run `canvasser pull` to regenerate it."
         )
@@ -307,7 +316,7 @@ def read_sheet(path: Path) -> Sheet:
                     data[column], where=f"{path.name} line {line}, {column}"
                 )
         if not data.get("assignment_id"):
-            raise ValueError(
+            raise SheetError(
                 f"{path} line {line} has no assignment_id. Row identity is "
                 f"(assignment_id, override_id) -- a row without one cannot be "
                 f"matched to anything, and guessing would target the wrong "
@@ -317,7 +326,7 @@ def read_sheet(path: Path) -> Sheet:
 
     duplicates = _duplicate_keys(rows)
     if duplicates:
-        raise ValueError(
+        raise SheetError(
             f"{path} has repeated row key(s): {duplicates}. Each "
             f"(assignment_id, override_id) must appear once -- otherwise push "
             f"cannot tell which row wins."

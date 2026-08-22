@@ -1,0 +1,57 @@
+[build-system]
+# >=77 for PEP 639: the SPDX `license` expression and `license-files` below.
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "canvasser"
+dynamic = ["version"]
+description = "Round-trip Canvas assignment dates through a CSV, by driving a browser"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Jei Blanchard" }]
+keywords = ["canvas", "lms", "instructure", "automation", "playwright", "teaching"]
+
+# "or-later" is the FSF's own recommendation and what their boilerplate says;
+# `GPL-3.0` alone is a deprecated SPDX id. Change to `GPL-3.0-only` if you mean
+# to pin it to version 3 exactly.
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Education",
+    "Natural Language :: English",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Education",
+    "Topic :: Utilities",
+]
+
+# Playwright is the whole delivery mechanism, not an optional extra: this
+# program navigates Canvas as a person would because UF discontinued API token
+# support. Note that installing the library does NOT install the browser it
+# drives -- `playwright install chromium` is a separate step, and the first-run
+# error says so.
+dependencies = ["playwright>=1.40"]
+
+[project.urls]
+Homepage = "https://github.com/doctorjei/canvasser"
+Source = "https://github.com/doctorjei/canvasser"
+Issues = "https://github.com/doctorjei/canvasser/issues"
+
+[project.scripts]
+canvasser = "canvasser.cli:main"
+
+[tool.setuptools]
+# Explicit rather than auto-discovered: the repo root also holds `scripts/`
+# (development smoke tests) and pulled CSVs, none of which belong in a wheel.
+packages = ["canvasser"]
+
+[tool.setuptools.dynamic]
+version = { attr = "canvasser.__version__" }

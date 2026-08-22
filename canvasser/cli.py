@@ -6,9 +6,9 @@
     canvasser pull <course_id>    # assignment due dates -> CSV
 
 Credentials come from the first source that has them: --secrets-file, the
-environment, the vault file, then a prompt. There is no password flag -- argv is
-not private -- so use a file, an env var, or sshpass for scripted runs. Run with
--v to see which source was used (never the value itself).
+environment, the default secrets file, then a prompt. There is no password flag
+-- argv is not private -- so use a file, an env var, or sshpass for scripted
+runs. Run with -v to see which source was used (never the value itself).
 """
 
 from __future__ import annotations
@@ -18,11 +18,13 @@ import os
 import sys
 from pathlib import Path
 
+from . import __version__
 from .auth import LoginError, ensure_logged_in, is_logged_in, quiesce
-from .browser import open_page
+from .browser import BrowserUnavailable, open_page
 from .assignments import format_in_course_time, pull_course, read_specific
 from .courses import Scope, apply_scope, fetch_courses, fetch_one
-from .datesheet import read_sheet, write_sheet
+from .dateparse import DateFormatError
+from .datesheet import SheetError, read_sheet, write_sheet
 from .display import (
     print_course_table,
     render_diff,
@@ -33,8 +35,8 @@ from .display import (
 )
 from .push import (
     FIELD_PAIRS,
+    align_timezone,
     check_course,
-    check_timezone,
     compare,
     to_minute,
     describe_scope,
@@ -267,9 +269,12 @@ def cmd_push(args: argparse.Namespace) -> int:
         current, course_tz = read_specific(page, config, course_id, targets)
 
     # The sheet's times are bare wall clocks; its `iana=` header is the only
-    # thing that says what they mean. Checked before the diff, because a zone
-    # change makes every comparison in it meaningless.
-    check_timezone(sheet, course_tz)
+    # thing that says what they mean. If that is not the course's zone, convert
+    # now -- before the diff, so both sides of every comparison, the values
+    # typed into the form, and the post-write check all speak course time.
+    sheet, realigned = align_timezone(sheet, course_tz)
+    if realigned:
+        print(f"\n  {realigned.describe()}", file=sys.stderr)
 
     diff = compare(sheet, current)
     print()
@@ -405,6 +410,20 @@ def build_parser() -> argparse.ArgumentParser:
         # Without this, argparse reflows the usage examples into one paragraph.
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    # Worth having on an installed copy: "which build is this?" is the first
+    # question when a user reports behaviour from a machine we cannot see. The
+    # licence line is the short notice the GPL asks an interactive program to
+    # show; `--version` is where a command-line tool conventionally puts it.
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=(
+            f"canvasser {__version__}\n"
+            "GPL-3.0-or-later. This program comes with ABSOLUTELY NO WARRANTY.\n"
+            "Free software: you are welcome to redistribute it under the terms\n"
+            "of the GNU General Public License <https://gnu.org/licenses/gpl>."
+        ),
+    )
     parser.add_argument(
         "--factor",
         choices=sorted(APPROVERS),
@@ -536,7 +555,19 @@ def main(argv: list[str] | None = None) -> int:
     }
     try:
         return handlers[args.command](args)
-    except (ConfigError, CourseSelectionError, LoginError, ApprovalError) as exc:
+    # Every one of these carries a message written for the person running the
+    # command -- a sheet to fix, a cell to correct, a login to redo. A
+    # traceback would bury it. Anything else still crashes loudly, because an
+    # unexpected exception IS a defect and should look like one.
+    except (
+        BrowserUnavailable,
+        ConfigError,
+        CourseSelectionError,
+        LoginError,
+        ApprovalError,
+        SheetError,
+        DateFormatError,
+    ) as exc:
         print(f"\nERROR: {exc}", file=sys.stderr)
         return 2
 

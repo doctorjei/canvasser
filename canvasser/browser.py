@@ -7,7 +7,7 @@ without bothering the user: Duo's remembered-device window is ~10 hours, and
 Canvas keeps its own session alongside it.
 
 The profile therefore holds live credentials-equivalent state and lives in the
-vault under mode-700, not in the workspace.
+state directory under mode-700, not in the working directory.
 """
 
 from __future__ import annotations
@@ -17,9 +17,39 @@ import json
 from collections.abc import Iterator
 from pathlib import Path
 
-from playwright.sync_api import BrowserContext, Page, sync_playwright
+from playwright.sync_api import (
+    BrowserContext,
+    Error as PlaywrightError,
+    Page,
+    sync_playwright,
+)
 
 from .config import PROFILE_DIR, SESSION_STATE_FILE
+
+
+class BrowserUnavailable(RuntimeError):
+    """Chromium could not be started, with an actionable reason."""
+
+
+def _launch_failure(exc: Exception) -> BrowserUnavailable:
+    """Turn Playwright's launch error into something worth reading.
+
+    `pip install canvasser` installs the Playwright *library* but not the
+    browser it drives -- that is a separate download, and hitting it is the
+    single most likely first-run failure. Playwright's own message does say so,
+    buried in a wall of text about drivers and revisions, so the instruction is
+    hoisted to the front here.
+    """
+    text = str(exc)
+    if "Executable doesn't exist" in text or "playwright install" in text:
+        return BrowserUnavailable(
+            "Chromium is not installed. `pip install canvasser` brings in the "
+            "Playwright library but not the browser it drives -- that is a "
+            "separate download:\n\n    playwright install chromium\n\n"
+            "(On Linux you may also need `playwright install-deps chromium`.)"
+        )
+    return BrowserUnavailable(f"could not start Chromium: {text}")
+
 
 #: The bundled headless build advertises "HeadlessChrome", which is both an
 #: unnecessary tell and a plausible trigger for bot-detection on the IdP. Present
@@ -43,16 +73,19 @@ def open_context(
     profile_dir.chmod(0o700)
 
     with sync_playwright() as p:
-        context = p.chromium.launch_persistent_context(
-            user_data_dir=str(profile_dir),
-            headless=headless,
-            slow_mo=slow_mo,
-            user_agent=USER_AGENT,
-            viewport=VIEWPORT,
-            locale="en-US",
-            timezone_id="America/New_York",
-            args=["--disable-blink-features=AutomationControlled"],
-        )
+        try:
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=str(profile_dir),
+                headless=headless,
+                slow_mo=slow_mo,
+                user_agent=USER_AGENT,
+                viewport=VIEWPORT,
+                locale="en-US",
+                timezone_id="America/New_York",
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+        except PlaywrightError as exc:
+            raise _launch_failure(exc) from exc
         context.set_default_timeout(30_000)
         _restore_session_cookies(context)
         try:
@@ -90,7 +123,8 @@ def _save_session_cookies(context: BrowserContext) -> None:
     """Persist cookies, including the session cookies Chromium would discard.
 
     The file is credential-equivalent -- it grants Canvas access without a
-    password -- so it lives in the vault at mode 600, never in the workspace.
+    password -- so it lives in the state directory at mode 600, never in the
+    working directory.
     """
     try:
         state = context.storage_state()

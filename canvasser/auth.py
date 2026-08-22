@@ -111,7 +111,7 @@ def _check_for_credential_rejection(page: Page) -> None:
             snapshot = save_debug_snapshot(page, "login-rejected")
             raise LoginError(
                 "GatorLink rejected the credentials. Check GATORLINK_USERNAME / "
-                f"GATORLINK_PASSWORD in the vault. Snapshot: {snapshot}"
+                f"GATORLINK_PASSWORD in the secrets file. Snapshot: {snapshot}"
             )
 
 

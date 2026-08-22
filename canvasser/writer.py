@@ -37,12 +37,12 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout
 
 from .browser import save_debug_snapshot
 from .config import Config
+from .dateparse import DateFormatError, resolve, zone_of
 
 #: Labels Canvas gives the three date fields. Stable and meaningful, unlike the
 #: React ids beside them (`Selectable___1`, `Select___2`) which are render-order
@@ -74,32 +74,18 @@ class Written:
 def to_profile_time(
     date_text: str, time_text: str, source_tz: str, profile_tz: str
 ) -> datetime:
-    """A sheet's course-local date/time as an instant in the profile's zone.
+    """A course-local date/time as an instant in the profile's zone.
 
-    Refuses a wall clock that does not exist. On the morning clocks go forward
-    there is no 02:30, and Python would happily invent one by shifting an hour
-    -- writing a deadline nobody asked for. Better to stop and say which cell.
+    The zone math -- including the refusal of a wall clock that does not exist
+    -- lives in `dateparse.resolve`, shared with the sheet realignment `push`
+    does. Only the exception type is translated: a bad cell reaching this far
+    is a write that must not be attempted, not a parse problem.
     """
-    stamp = f"{date_text} {time_text or '00:00'}"
-    for pattern in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
-        try:
-            naive = datetime.strptime(stamp, pattern)
-            break
-        except ValueError:
-            continue
-    else:
-        raise WriteRefused(f"cannot read {stamp!r} as a date and time")
-
-    source = ZoneInfo(source_tz)
-    local = naive.replace(tzinfo=source)
-    # A nonexistent local time survives the round trip as a *different* wall
-    # clock; a real one comes back unchanged.
-    if local.astimezone(ZoneInfo("UTC")).astimezone(source).replace(tzinfo=None) != naive:
-        raise WriteRefused(
-            f"{stamp} does not exist in {source_tz} -- it falls in the hour "
-            f"skipped by a daylight-saving change. Pick a different time."
-        )
-    return local.astimezone(ZoneInfo(profile_tz))
+    try:
+        local = resolve(date_text, time_text, source_tz)
+        return local.astimezone(zone_of(profile_tz))
+    except DateFormatError as exc:
+        raise WriteRefused(str(exc)) from exc
 
 
 def format_for_form(moment: datetime) -> tuple[str, str]:

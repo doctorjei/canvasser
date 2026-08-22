@@ -7,10 +7,20 @@ storage_state*.json
 browser-profile/
 cookies*.json
 
+# Machine-specific harness settings. CANVASSER_HOME points at this box's vault
+# mount, which exists nowhere else -- it must not be committed to a public repo.
+.claude/settings.local.json
+
 # Local environment
 .venv/
 __pycache__/
 *.py[cod]
+
+# Build artifacts. Never commit these: a stale wheel in the tree is the easiest
+# way to publish a version that does not match the source it claims to be.
+dist/
+build/
+*.egg-info/
 
 # Pulled data, not source. Today these hold assignment titles and dates; once
 # per-student overrides are in scope a row can name an individual student, which

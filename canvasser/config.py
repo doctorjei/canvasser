@@ -1,17 +1,30 @@
 """Configuration and secret loading.
 
-Secrets live in ~/vault/rw/secrets/ and never in the workspace. The vault is the
-only writable store that survives a full box rebuild, and keeping credentials
-physically outside the repo means they cannot be committed by accident.
+Secrets, the saved session, and the browser profile live in one per-user state
+directory and **never in the working directory** -- keeping them physically
+outside any repo means they cannot be committed by accident.
 
-That vault file is the *default* source, not the only one -- see
+Where that directory is depends on the machine (`state_dir`):
+
+    $CANVASSER_HOME                        explicit, wins outright
+    %LOCALAPPDATA%\\canvasser               Windows
+    ~/Library/Application Support/...      macOS
+    $XDG_STATE_HOME/canvasser              otherwise (~/.local/state/canvasser)
+
+The platform directory is the default; `$CANVASSER_HOME` is the only thing that
+changes it. Notably that includes the sandbox this was developed in, which
+keeps its state on a durable mount -- it sets the variable like anywhere else
+would, rather than being special-cased here.
+
+The secrets file is the *default* credential source, not the only one -- see
 `credentials.py` for the full precedence chain (flag > --secrets-file > env >
-vault > prompt).
+file > prompt).
 """
 
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -30,24 +43,61 @@ __all__ = [
     "ConfigError",
     "ENV_FILE",
     "GATORLINK_SSO_URL",
+    "HOME_VAR",
     "IDP_HOST",
     "PROFILE_DIR",
     "SESSION_STATE_FILE",
+    "STATE_DIR",
     "load_config",
+    "state_dir",
 ]
 
-VAULT_SECRETS = Path.home() / "vault" / "rw" / "secrets"
-ENV_FILE = VAULT_SECRETS / "canvas.env"
+#: The one override. Everything else is the platform's own answer.
+HOME_VAR = "CANVASSER_HOME"
+
+
+def state_dir() -> Path:
+    """Where the session, browser profile, and secrets file live.
+
+    Everything under here is credential-equivalent -- the saved cookies grant
+    Canvas access with no password -- so it is never the working directory and
+    never the installed package. It is per-user state, and it goes where the
+    platform puts per-user state.
+
+    **The platform directory is the default, always.** An earlier version
+    preferred `~/vault/rw/secrets` whenever that path happened to exist, which
+    made the location depend on an unrelated directory being present -- fine in
+    the sandbox this was built in, surprising anywhere else. A machine that
+    wants a different location says so with `$CANVASSER_HOME`, which is
+    explicit and needs no rule to explain it.
+    """
+    override = os.environ.get(HOME_VAR)
+    if override:
+        return Path(override).expanduser()
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local"
+        return Path(base) / "canvasser"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "canvasser"
+    # XDG. `state` rather than `config` or `cache`: this is data the program
+    # writes and needs back, and losing it costs a re-login.
+    base = os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state"
+    return Path(base) / "canvasser"
+
+
+STATE_DIR = state_dir()
+ENV_FILE = STATE_DIR / "canvas.env"
 
 #: Browser profile lives beside the secrets, for the same durability reason. It
 #: holds live session cookies, so it is exactly as sensitive as the password.
-PROFILE_DIR = VAULT_SECRETS / "browser-profile"
+PROFILE_DIR = STATE_DIR / "browser-profile"
 
 #: Cookies saved between runs. Canvas and Shibboleth both issue *non-persistent*
 #: session cookies, which Chromium discards on close, so the persistent profile
 #: alone loses the login every time. This file is credential-equivalent: it grants
-#: Canvas access with no password. Mode 600, in the vault, never in the workspace.
-SESSION_STATE_FILE = VAULT_SECRETS / "storage_state.json"
+#: Canvas access with no password. Mode 600, alongside the state, never in the
+#: working directory.
+SESSION_STATE_FILE = STATE_DIR / "storage_state.json"
 
 CANVAS_BASE_URL = "https://ufl.instructure.com"
 GATORLINK_SSO_URL = f"{CANVAS_BASE_URL}/login/saml/355"

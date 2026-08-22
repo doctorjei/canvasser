@@ -31,12 +31,21 @@ never warn, which is the argument for preferring them in a sheet.
 stopping: the failure mode of a wrong guess is a wrong due date in a live
 course, and the failure mode of an error is a message telling the user which
 cell to fix.
+
+## Giving a wall clock a zone
+
+The second half of this module (`resolve`, `convert`) turns a bare date/time
+into an instant. Every place in the program that does this goes through here,
+so the nonexistent-hour check exists once: the write path converting course
+time to the profile's zone, and `push` realigning a sheet written in one zone
+onto a course running in another.
 """
 
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, timezone as _utc
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 #: Unambiguous forms, tried before any day/month reasoning. The canonical form
 #: is first so the common case is one try.
@@ -77,6 +86,86 @@ _SPACES = re.compile(r"\s+")
 
 class DateFormatError(ValueError):
     """A cell could not be read as a date or a time."""
+
+
+class ImpossibleTimeError(DateFormatError):
+    """A wall clock that does not exist in its zone.
+
+    On the morning clocks go forward there is no 02:30. Python will happily
+    invent one by shifting an hour, which writes a deadline nobody asked for --
+    so this is raised instead, naming the cell.
+    """
+
+
+#: The canonical shapes `normalize_date`/`normalize_time` produce. Seconds are
+#: accepted because live Canvas values carry them (`23:59:59`) even though a
+#: sheet's cells never do.
+_STAMP_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M")
+
+
+def resolve(date_text: str, time_text: str, tz: str, *, where: str = "") -> datetime:
+    """A wall clock in `tz` as an aware instant.
+
+    This is the single place a bare date/time acquires a zone, and therefore
+    the single place the nonexistent-hour check lives. Both the write path
+    (course time -> profile time) and the sheet realignment (sheet time ->
+    course time) go through it, so neither can drift from the other.
+    """
+    stamp = f"{date_text} {time_text or '00:00'}"
+    for pattern in _STAMP_FORMATS:
+        try:
+            naive = datetime.strptime(stamp, pattern)
+            break
+        except ValueError:
+            continue
+    else:
+        raise DateFormatError(f"cannot read {stamp!r} as a date and time{_at(where)}")
+
+    zone = zone_of(tz, where=where)
+    local = naive.replace(tzinfo=zone)
+    # A nonexistent local time survives a round trip through UTC as a
+    # *different* wall clock; a real one comes back unchanged.
+    if local.astimezone(_utc.utc).astimezone(zone).replace(tzinfo=None) != naive:
+        raise ImpossibleTimeError(
+            f"{stamp} does not exist in {tz}{_at(where)} -- it falls in the "
+            f"hour skipped by a daylight-saving change. Pick a different time."
+        )
+    return local
+
+
+def convert(
+    date_text: str, time_text: str, source_tz: str, target_tz: str, *, where: str = ""
+) -> tuple[str, str]:
+    """The same instant, re-expressed as a wall clock in `target_tz`.
+
+    **The instant is what is preserved, not the wall clock.** A deadline typed
+    as 12:59 in Tokyo is the same moment as 23:59 the previous day in New York,
+    and it is the moment the student is held to.
+    """
+    moment = resolve(date_text, time_text, source_tz, where=where)
+    moment = moment.astimezone(zone_of(target_tz, where=where))
+    return moment.strftime("%Y-%m-%d"), render_time(moment)
+
+
+def render_time(moment: datetime) -> str:
+    """`HH:MM`, or `HH:MM:SS` when the seconds are not zero.
+
+    Matches `assignments.format_in_course_time`: Canvas stores end-of-day
+    deadlines as `:59`, and truncating those would make a no-op round trip look
+    like a real change.
+    """
+    return moment.strftime("%H:%M:%S" if moment.second else "%H:%M")
+
+
+def zone_of(tz: str, *, where: str = "") -> ZoneInfo:
+    """`ZoneInfo`, with a message that names the bad zone rather than a KeyError."""
+    try:
+        return ZoneInfo(tz)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise DateFormatError(
+            f"unknown timezone {tz!r}{_at(where)}. Row 1's `iana=` must be an "
+            f"IANA identifier such as America/New_York."
+        ) from exc
 
 
 def _clean(value: str) -> str:

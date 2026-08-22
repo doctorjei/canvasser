@@ -31,17 +31,43 @@ course; only `--commit` writes.
 
 ## Requirements
 
-- Python 3.13
+- Python 3.10+ (developed and tested on 3.13)
 - A UF GatorLink account with Duo MFA
-- Linux; no display required (runs headless)
+- No display required — runs headless
 
-## Setup
+## Install
+
+```bash
+pip install canvasser
+playwright install chromium      # on Linux: playwright install --with-deps chromium
+```
+
+The second line is not optional and is not automatic. `pip` installs the Playwright
+*library*; the browser it drives is a separate download. Running `canvasser` without it
+fails immediately and says exactly this.
+
+### From a checkout instead
 
 ```bash
 python3 -m venv .venv
-./.venv/bin/pip install playwright
+./.venv/bin/pip install -e .
 ./.venv/bin/python -m playwright install --with-deps chromium
 ```
+
+### Where it keeps things
+
+The saved session, browser profile, and optional secrets file share one per-user directory —
+never the working directory, so nothing credential-bearing can be committed by accident:
+
+| | |
+|---|---|
+| `%LOCALAPPDATA%\canvasser` | Windows |
+| `~/Library/Application Support/canvasser` | macOS |
+| `$XDG_STATE_HOME/canvasser` | otherwise — usually `~/.local/state/canvasser` |
+
+Set **`$CANVASSER_HOME`** to put it somewhere else; that is the only thing that overrides the
+platform default. Use it to keep state on a durable or encrypted volume, or to run two
+identities side by side.
 
 ## Credentials
 
@@ -49,7 +75,7 @@ Resolved per field, first source that has them wins:
 
 1. `--secrets-file PATH` (`--username` supplies the name)
 2. `$GATORLINK_USERNAME` / `$GATORLINK_PASSWORD`
-3. `~/vault/rw/secrets/canvas.env` (mode `600`)
+3. `canvas.env` in the state directory above (mode `600`)
 4. an interactive prompt
 
 **There is deliberately no `--password` flag.** OpenSSH is the model: argv is not private —
@@ -124,6 +150,11 @@ bulk-shift them: `open_*` is Canvas's `unlock_at` ("Available from"), `due_*` is
 - **The timezone is declared once, in row 1, twice over**: `timezone=` is Canvas's familiar
   name for people, `iana=` is the identifier `push` resolves wall clocks through. Values
   themselves carry no offset.
+- **`iana=` says what zone the sheet's own times are written in** — nothing more. If it is
+  not the course's zone, `push` converts every value into course time before comparing or
+  writing, preserving the *instant*, and prints what it did. A sheet edited in Tokyo saying
+  `2026-08-29 12:59` and a New York course holding `2026-08-28 23:59` are the same deadline.
+  If `iana=` is missing, the times are taken to be course-local already.
 - **Times are minute-only.** Canvas's time box has no seconds field, so seconds cannot be
   written; `11:59 PM` is what a person types and Canvas applies its own `:59`. Seconds you
   type are accepted and dropped.
@@ -140,8 +171,9 @@ Each of these is refused because it is untested, not because it is hard:
   submits *every* date card, so a wrong move there would silently delete a student's
   accommodation date;
 - **clearing a date**;
-- **a sheet whose timezone no longer matches the course's** — it tells you to re-pull;
-- **a time that does not exist**, in the hour skipped by a daylight-saving change.
+- **a time that does not exist**, in the hour skipped by a daylight-saving change;
+- **a date with no time, when the sheet's zone differs from the course's** — converting
+  would have to assume a time, and a different assumed time lands on a different *date*.
 
 After writing, `push` re-reads the assignment's own page state and compares date *and* time,
 so a save that silently did not take is reported rather than assumed.
@@ -150,7 +182,8 @@ so a save that silently did not take is reported rather than assumed.
 
 This repository is public.
 
-- **Credentials never live in the repo.** They belong in `~/vault/rw/secrets/`.
+- **Credentials never live in the repo.** They belong in the state directory described under
+  "Where it keeps things", which is deliberately outside any working tree.
 - `storage_state.json` (the saved session) is **credential-equivalent** — it grants Canvas
   access with no password.
 - The browser profile holds live session cookies and is **as sensitive as the password**.
@@ -158,3 +191,19 @@ This repository is public.
   outside the repository on purpose.
 - Pulled CSVs are gitignored: they will contain per-student rows once individual overrides
   are in scope.
+
+## License
+
+GPL-3.0-or-later. See [LICENSE](LICENSE).
+
+This program is free software: you may redistribute it and/or modify it under the terms of
+the GNU General Public License as published by the Free Software Foundation, either version 3
+of the License, or (at your option) any later version. It comes with **absolutely no
+warranty**.
+
+## Scope: this is a UF tool
+
+`CANVAS_BASE_URL` is overridable, but the login path is not: the SSO deep link
+(`/login/saml/355`) and the identity provider (`login.ufl.edu`) are UF's, and the second
+factor assumes Duo. Another institution's Canvas will read fine only if you can already
+authenticate to it some other way — sign-in is not portable as written.

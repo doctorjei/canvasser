@@ -6,7 +6,7 @@ password from a prompt:
 
     1. explicit secret file    --secrets-file PATH   (--username for the name)
     2. environment variable    GATORLINK_USERNAME / GATORLINK_PASSWORD
-    3. default vault file      ~/vault/rw/secrets/canvas.env
+    3. default secrets file    canvas.env in config.state_dir()
     4. interactive prompt      only when a controlling terminal exists
 
 **There is deliberately no password flag at all** -- not `--password`, not
