@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import contextlib
 import json
+import subprocess
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -31,24 +33,69 @@ class BrowserUnavailable(RuntimeError):
     """Chromium could not be started, with an actionable reason."""
 
 
+#: Roughly what `playwright install chromium` pulls down, for the prompt. Worth
+#: naming: consenting to a download is different from consenting to a command.
+DOWNLOAD_SIZE = "~150 MB"
+
+INSTALL_HINT = (
+    "Chromium is not installed. The `playwright` package on PyPI ships the "
+    "library and its driver, but not the browser binaries -- those are a "
+    "separate download, because they are platform-specific native builds "
+    "rather than Python. Install them with:\n\n"
+    "    canvasser install-browser\n\n"
+    "which runs `playwright install chromium` for you, in this interpreter's "
+    "own environment."
+)
+
+
+def _is_missing_browser(exc: Exception) -> bool:
+    """Whether a launch failure means "no browser" rather than "launch broke".
+
+    Matched on Playwright's own wording. Deliberately narrow: treating any
+    launch failure as a missing browser would offer to download 150 MB in
+    answer to a sandbox or permissions problem, which fixes nothing and looks
+    like the tool guessing.
+    """
+    text = str(exc)
+    return "Executable doesn't exist" in text or "playwright install" in text
+
+
 def _launch_failure(exc: Exception) -> BrowserUnavailable:
     """Turn Playwright's launch error into something worth reading.
 
-    `pip install canvasser` installs the Playwright *library* but not the
-    browser it drives -- that is a separate download, and hitting it is the
-    single most likely first-run failure. Playwright's own message does say so,
-    buried in a wall of text about drivers and revisions, so the instruction is
-    hoisted to the front here.
+    Playwright's own message does say what to do, buried in a wall of text
+    about drivers and revisions, so the instruction is hoisted to the front.
     """
-    text = str(exc)
-    if "Executable doesn't exist" in text or "playwright install" in text:
-        return BrowserUnavailable(
-            "Chromium is not installed. `pip install canvasser` brings in the "
-            "Playwright library but not the browser it drives -- that is a "
-            "separate download:\n\n    playwright install chromium\n\n"
-            "(On Linux you may also need `playwright install-deps chromium`.)"
+    if _is_missing_browser(exc):
+        return BrowserUnavailable(INSTALL_HINT)
+    return BrowserUnavailable(f"could not start Chromium: {exc}")
+
+
+def install_chromium(with_deps: bool = False) -> None:
+    """Run Playwright's own installer for Chromium. **Downloads ~150 MB.**
+
+    `sys.executable -m playwright` rather than a bare `playwright`: the CLI on
+    PATH may belong to a different environment than the one importing this
+    module -- a venv that was never activated, a pipx install, a system Python.
+    Installing into the wrong one downloads 150 MB and changes nothing here.
+
+    Output is not captured, so the user sees the real progress rather than a
+    silent multi-minute pause.
+    """
+    command = [sys.executable, "-m", "playwright", "install"]
+    if with_deps:
+        # Needs root on most Linux distributions; only offered explicitly.
+        command.append("--with-deps")
+    command.append("chromium")
+
+    print(f"  Running: {' '.join(command)}", file=sys.stderr)
+    result = subprocess.run(command)
+    if result.returncode != 0:
+        raise BrowserUnavailable(
+            f"`{' '.join(command)}` exited {result.returncode}. On Linux the "
+            f"browser may also need system libraries: try "
+            f"`canvasser install-browser --with-deps` (which needs root)."
         )
-    return BrowserUnavailable(f"could not start Chromium: {text}")
 
 
 #: The bundled headless build advertises "HeadlessChrome", which is both an
@@ -67,25 +114,44 @@ def open_context(
     profile_dir: Path = PROFILE_DIR,
     headless: bool = True,
     slow_mo: int = 0,
+    on_missing_browser=None,
 ) -> Iterator[BrowserContext]:
-    """Open the persistent browser context, creating the profile if needed."""
+    """Open the persistent browser context, creating the profile if needed.
+
+    `on_missing_browser` is an optional callable invoked when the launch fails
+    *because Chromium was never downloaded*. Returning True means it has been
+    installed and the launch should be retried once. The decision to prompt and
+    download lives with the caller, not here -- this module should not own the
+    question of whether there is a human to ask.
+    """
     profile_dir.mkdir(parents=True, exist_ok=True)
     profile_dir.chmod(0o700)
 
+    def launch(p):
+        return p.chromium.launch_persistent_context(
+            user_data_dir=str(profile_dir),
+            headless=headless,
+            slow_mo=slow_mo,
+            user_agent=USER_AGENT,
+            viewport=VIEWPORT,
+            locale="en-US",
+            timezone_id="America/New_York",
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+
     with sync_playwright() as p:
         try:
-            context = p.chromium.launch_persistent_context(
-                user_data_dir=str(profile_dir),
-                headless=headless,
-                slow_mo=slow_mo,
-                user_agent=USER_AGENT,
-                viewport=VIEWPORT,
-                locale="en-US",
-                timezone_id="America/New_York",
-                args=["--disable-blink-features=AutomationControlled"],
-            )
+            context = launch(p)
         except PlaywrightError as exc:
-            raise _launch_failure(exc) from exc
+            # One retry, and only for a missing browser. If the install ran and
+            # the launch still fails, report that failure rather than looping.
+            if not (_is_missing_browser(exc) and on_missing_browser
+                    and on_missing_browser()):
+                raise _launch_failure(exc) from exc
+            try:
+                context = launch(p)
+            except PlaywrightError as retry_exc:
+                raise _launch_failure(retry_exc) from retry_exc
         context.set_default_timeout(30_000)
         _restore_session_cookies(context)
         try:

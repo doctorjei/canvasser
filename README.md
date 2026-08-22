@@ -39,19 +39,37 @@ course; only `--commit` writes.
 
 ```bash
 pip install canvasser
-playwright install chromium      # on Linux: playwright install --with-deps chromium
 ```
 
-The second line is not optional and is not automatic. `pip` installs the Playwright
-*library*; the browser it drives is a separate download. Running `canvasser` without it
-fails immediately and says exactly this.
+That is the whole install. The first command that needs a browser will notice one is missing
+and offer to fetch it:
+
+```
+Chromium is not installed; canvasser cannot drive Canvas without it.
+Download it now (~150 MB, one time)? [y/N]
+```
+
+Answer `y` and it continues into the command you asked for. To do it ahead of time, or in a
+script, run `canvasser install-browser` (add `--with-deps` on Linux to pull the system
+libraries Chromium needs; that part needs root).
+
+**Why there is a download at all.** The `playwright` package on PyPI ships the automation
+library and its driver, not the browser — browser builds are large platform-specific native
+binaries, not Python, so no PyPI package carries them. Playwright pins an exact build per
+library version, which is the whole reason page behaviour is reproducible.
+
+The browsers land in a **shared per-user cache** (`~/.cache/ms-playwright` and equivalents),
+so it is once per machine rather than once per virtualenv — verified under plain venvs,
+`pipx`, `uv tool install`, and throwaway `uvx` environments. Nothing is downloaded without
+asking: with no terminal attached (cron, CI, a pipe) canvasser declines and prints the
+command instead.
 
 ### From a checkout instead
 
 ```bash
 python3 -m venv .venv
 ./.venv/bin/pip install -e .
-./.venv/bin/python -m playwright install --with-deps chromium
+./.venv/bin/python -m canvasser install-browser --with-deps
 ```
 
 ### Where it keeps things

@@ -20,7 +20,12 @@ from pathlib import Path
 
 from . import __version__
 from .auth import LoginError, ensure_logged_in, is_logged_in, quiesce
-from .browser import BrowserUnavailable, open_page
+from .browser import (
+    DOWNLOAD_SIZE,
+    BrowserUnavailable,
+    install_chromium,
+    open_page,
+)
 from .assignments import format_in_course_time, pull_course, read_specific
 from .courses import Scope, apply_scope, fetch_courses, fetch_one
 from .dateparse import DateFormatError
@@ -50,7 +55,12 @@ from .writer import (
 )
 from .selection import COURSE_VAR, CourseSelectionError, select_course
 from .config import Config, ConfigError, ENV_FILE, load_config
-from .credentials import PASSWORD_VAR, USERNAME_VAR
+from .credentials import (
+    PASSWORD_VAR,
+    USERNAME_VAR,
+    _read_from_tty,
+    tty_available,
+)
 from .duo import APPROVERS, ApprovalError
 
 
@@ -71,9 +81,47 @@ def config_from_args(args: argparse.Namespace) -> "Config":
     return config
 
 
+def browser_installer(args: argparse.Namespace):
+    """A callback that offers to download Chromium, or None if it must not ask.
+
+    Passed to `open_context`, which calls it only when a launch failed because
+    the browser was never downloaded. Returning True means "installed, retry".
+
+    Prompting is the point: this is a ~150 MB download onto someone's machine,
+    and a tool that starts one unannounced is a tool people stop trusting. With
+    no terminal -- cron, CI, a pipe -- it declines and the normal error explains
+    the command, rather than silently pulling 150 MB in a context where nobody
+    would see it happen.
+    """
+    if args.no_prompt or not tty_available():
+        return None
+
+    def ask() -> bool:
+        answer = _read_from_tty(
+            f"\n  Chromium is not installed; canvasser cannot drive Canvas "
+            f"without it.\n  Download it now ({DOWNLOAD_SIZE}, one time)? [y/N] "
+        )
+        if answer.strip().lower() not in ("y", "yes"):
+            print("  Declined. Run `canvasser install-browser` when ready.",
+                  file=sys.stderr)
+            return False
+        install_chromium()
+        return True
+
+    return ask
+
+
+def cmd_install_browser(args: argparse.Namespace) -> int:
+    """Download the browser Playwright drives. The one non-Canvas command."""
+    install_chromium(with_deps=args.with_deps)
+    print("Chromium installed.")
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     config = config_from_args(args)
-    with open_page(headless=not args.headed) as page:
+    with open_page(headless=not args.headed,
+                   on_missing_browser=browser_installer(args)) as page:
         alive = is_logged_in(page, config)
     print("Session: ALIVE (authenticated)" if alive else "Session: DEAD (login required)")
     return 0 if alive else 1
@@ -82,7 +130,8 @@ def cmd_status(args: argparse.Namespace) -> int:
 def cmd_login(args: argparse.Namespace) -> int:
     config = config_from_args(args)
     approver = APPROVERS[args.factor]()
-    with open_page(headless=not args.headed) as page:
+    with open_page(headless=not args.headed,
+                   on_missing_browser=browser_installer(args)) as page:
         performed = ensure_logged_in(page, config, approver)
     print("Logged in." if performed else "Already logged in; nothing to do.")
     return 0
@@ -92,7 +141,8 @@ def cmd_courses(args: argparse.Namespace) -> int:
     """Read the course list off the Courses page, as a person would see it."""
     config = config_from_args(args)
     approver = APPROVERS[args.factor]()
-    with open_page(headless=not args.headed) as page:
+    with open_page(headless=not args.headed,
+                   on_missing_browser=browser_installer(args)) as page:
         ensure_logged_in(page, config, approver)
         courses = apply_scope(fetch_courses(page, config), scope_from_args(args))
 
@@ -164,7 +214,8 @@ def cmd_settings(args: argparse.Namespace) -> int:
     if not chosen:
         chosen = ["general"]
 
-    with open_page(headless=not args.headed) as page:
+    with open_page(headless=not args.headed,
+                   on_missing_browser=browser_installer(args)) as page:
         ensure_logged_in(page, config, approver)
         course = _resolve_course(page, config, args)
         settings = fetch_settings(page, config, course.id)
@@ -181,7 +232,8 @@ def cmd_pull(args: argparse.Namespace) -> int:
     config = config_from_args(args)
     approver = APPROVERS[args.factor]()
 
-    with open_page(headless=not args.headed) as page:
+    with open_page(headless=not args.headed,
+                   on_missing_browser=browser_installer(args)) as page:
         ensure_logged_in(page, config, approver)
 
         course = _resolve_course(page, config, args)
@@ -244,7 +296,8 @@ def cmd_push(args: argparse.Namespace) -> int:
 
     config = config_from_args(args)
     approver = APPROVERS[args.factor]()
-    with open_page(headless=not args.headed) as page:
+    with open_page(headless=not args.headed,
+                   on_missing_browser=browser_installer(args)) as page:
         ensure_logged_in(page, config, approver)
         # The sheet names its own course, so there is nothing to resolve --
         # and resolving one from flags would invite pushing into the wrong
@@ -298,7 +351,8 @@ def cmd_push(args: argparse.Namespace) -> int:
     by_key = sheet.by_key()
     print(f"\nCommitting to course {course_id}. Times read as {source_tz}.")
     failures = 0
-    with open_page(headless=not args.headed) as page:
+    with open_page(headless=not args.headed,
+                   on_missing_browser=browser_installer(args)) as page:
         ensure_logged_in(page, config, approver)
         for row in diff.changed:
             wanted = by_key[row.key]
@@ -462,6 +516,23 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", help="check whether the stored session is still valid")
     sub.add_parser("login", help="authenticate, prompting for Duo if needed")
 
+    install = sub.add_parser(
+        "install-browser",
+        help=f"download the Chromium build canvasser drives ({DOWNLOAD_SIZE})",
+        description="Runs `playwright install chromium` in this interpreter's "
+        "own environment. `pip install canvasser` brings in the Playwright "
+        "library from PyPI, but the browser binaries are a separate download "
+        "-- they are platform-specific native builds, not Python. They land in "
+        "a shared per-user cache, so this is once per machine, not once per "
+        "virtualenv. Every other command offers to run this for you the first "
+        "time it needs a browser.",
+    )
+    install.add_argument(
+        "--with-deps",
+        action="store_true",
+        help="also install the system libraries Chromium needs (Linux; needs root)",
+    )
+
     courses = sub.add_parser("courses", help="list courses (with ids) from the Courses page")
     courses.add_argument("--filter", help="substring match against course name or term")
     courses.add_argument(
@@ -548,6 +619,7 @@ def main(argv: list[str] | None = None) -> int:
     handlers = {
         "status": cmd_status,
         "login": cmd_login,
+        "install-browser": cmd_install_browser,
         "courses": cmd_courses,
         "pull": cmd_pull,
         "settings": cmd_settings,
