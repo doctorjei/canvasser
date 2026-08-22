@@ -122,6 +122,146 @@ _INPUT_INDEX = """(label) => {
 }"""
 
 
+#: The same date/time pair, read back out of the DOM. Located by label and
+#: adjacency exactly as `_INPUT_INDEX` does, rather than by remembering an
+#: index: the picker popup adds and removes visible inputs, so an index taken
+#: before typing does not reliably still mean the same box afterwards.
+_FIELD_VALUES = """(label) => {
+    const labelOf = e => {
+        const byFor = e.id && document.querySelector(`label[for="${CSS.escape(e.id)}"]`);
+        return (byFor?.textContent || e.getAttribute('aria-label') || '').trim();
+    };
+    const inputs = [...document.querySelectorAll('input')]
+        .filter(e => e.type !== 'hidden' && e.offsetParent !== null);
+    const i = inputs.findIndex(e => labelOf(e).toLowerCase().startsWith(label.toLowerCase()));
+    if (i < 0) return null;
+    const next = inputs[i + 1];
+    if (!next || !/^time$/i.test(labelOf(next))) return null;
+    return {date: inputs[i].value.trim(), time: next.value.trim()};
+}"""
+
+#: What "the form has finished initialising" actually looks like.
+#:
+#: Canvas disables its submit button and labels it **"Loading..."** until every
+#: async panel on the page has loaded. On a Turnitin-backed assignment the
+#: plagiarism panel keeps that going for many seconds. Proved live 2026-08-22:
+#: two assignments failed with "no Save button" and their snapshots showed a
+#: fully-typed form, a spinning Turnitin panel, and a greyed "Loading..."
+#: button.
+#:
+#: Waiting for this state rather than sleeping is the whole fix. A fixed sleep
+#: also silently corrupts the *successful* path: if the async load lands after
+#: the dates are typed, React re-initialises the form from server state, the
+#: typed values vanish, and the save writes the old dates while looking
+#: perfectly healthy.
+SAVE_READY = """() => {
+    const controls = [...document.querySelectorAll('button, input[type=submit]')]
+        .filter(e => e.offsetParent !== null);
+    return controls.some(e =>
+        /^\\s*save\\s*$/i.test((e.textContent || e.value || '').trim()) && !e.disabled);
+}"""
+
+#: The other half of "ready", and the half a Save-only check misses.
+#:
+#: **The Assign-To card mounts AFTER the submit button goes live.** Found by
+#: recon on 2026-08-22: immediately after `SAVE_READY` became true, the form's
+#: visible inputs were Assignment Name, Points, two checkboxes -- and no date
+#: row at all. Acting on that moment finds no date field and no Clear button,
+#: which is exactly how the first live clearing attempt failed.
+DATES_READY = """() => {
+    const labelOf = e => {
+        const byFor = e.id && document.querySelector(`label[for="${CSS.escape(e.id)}"]`);
+        return (byFor?.textContent || e.getAttribute('aria-label') || '').trim();
+    };
+    const inputs = [...document.querySelectorAll('input')]
+        .filter(e => e.type !== 'hidden' && e.offsetParent !== null);
+    const i = inputs.findIndex(e =>
+        /^(due|available from|until)\\b/i.test(labelOf(e)));
+    if (i < 0) return false;
+    const next = inputs[i + 1];
+    return !!next && /^time$/i.test(labelOf(next));
+}"""
+
+#: Both halves. Waiting on one of them is waiting on half a form.
+FORM_READY = f"() => ({SAVE_READY})() && ({DATES_READY})()"
+
+
+#: Each date row carries its own **Clear** button, and that button says which
+#: row it belongs to -- in a screen-reader span, not on screen:
+#:
+#:     <button>  "Clear due date/time for Everyone"            + "Clear"
+#:     <button>  "Clear available from date/time for Everyone" + "Clear"
+#:     <button>  "Clear until date/time for Everyone"          + "Clear"
+#:
+#: So `textContent` reads `"Clear due date/time for EveryoneClear"`. A first
+#: attempt matched `^clear$` against that and found nothing on the live form
+#: (2026-08-22), which is why this is now matched on the accessible phrase.
+#:
+#: That is a better handle than the document-order adjacency used for the
+#: inputs: it **names the field**, so it cannot silently land on a neighbouring
+#: row. Canvas's own control is used rather than blanking the boxes by hand,
+#: because a hand-blanked widget still holds parsed state its text no longer
+#: matches, and what then gets submitted is anyone's guess.
+#:
+#: The match is tagged with an attribute so the click targets that exact
+#: element rather than an index the click itself could invalidate.
+_MARK_CLEAR = """(label) => {
+    const visible = e => e.offsetParent !== null;
+    const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
+    const escaped = label.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&').replace(/ +/g, '\\\\s+');
+    const wanted = new RegExp('^clear\\\\s+' + escaped + '\\\\s+date/time\\\\b', 'i');
+
+    document.querySelectorAll('[data-canvasser-clear]')
+        .forEach(e => e.removeAttribute('data-canvasser-clear'));
+    const hits = [...document.querySelectorAll('button')]
+        .filter(visible)
+        .filter(e => wanted.test(norm(e.textContent)));
+    if (hits.length === 1) hits[0].setAttribute('data-canvasser-clear', '1');
+    return hits.length;
+}"""
+
+
+def clear_field(page: Page, label: str) -> None:
+    """Empty one date row using the form's own Clear control.
+
+    Raises rather than falling back to blanking the boxes by hand, and refuses
+    a tie rather than picking: a date the tool *thinks* it cleared and did not
+    is a deadline still hanging over a class.
+    """
+    found = page.evaluate(_MARK_CLEAR, label)
+    if found != 1:
+        snapshot = save_debug_snapshot(page, f"no-clear-{label.replace(' ', '-')}")
+        raise WriteFailed(
+            f"expected exactly one 'Clear' button for the {label!r} date on "
+            f"{page.url}, found {found}. Canvas's date-row layout has changed "
+            f"and clearing must be re-checked before it is trusted. "
+            f"Snapshot: {snapshot}"
+        )
+    page.locator('[data-canvasser-clear="1"]').click()
+    page.wait_for_timeout(200)
+
+
+def wait_for_form(page: Page, timeout: int = 90_000) -> None:
+    """Block until the edit form can actually be saved.
+
+    Generous timeout: this is waiting on a third-party LTI panel, it happens
+    once per assignment, and the cost of giving up early is either a refused
+    write or -- far worse -- a silent one that saves the wrong dates.
+    """
+    try:
+        page.wait_for_function(FORM_READY, timeout=timeout)
+    except PlaywrightTimeout:
+        snapshot = save_debug_snapshot(page, "form-never-ready")
+        save_ready = page.evaluate(SAVE_READY)
+        dates_ready = page.evaluate(DATES_READY)
+        raise WriteFailed(
+            f"the edit form at {page.url} never finished loading after "
+            f"{timeout // 1000}s (save button ready: {save_ready}; date row "
+            f"present: {dates_ready}). Nothing was typed or saved. "
+            f"Snapshot: {snapshot}"
+        ) from None
+
+
 def find_field(page: Page, label: str) -> tuple[int, int]:
     """Indices of the (date, time) inputs for one Canvas date field.
 
@@ -180,8 +320,10 @@ def apply_changes(
     for why both of those are non-negotiable.
     """
     _open_editor(page, config, course_id, assignment_id)
-    # The date fields are React and mount after ENV lands.
-    page.wait_for_timeout(2_500)
+    # NOT a sleep. See SAVE_READY: the form's own submit button reports when it
+    # is done initialising, and typing before then is how dates get silently
+    # reverted and the wrong values saved.
+    wait_for_form(page)
 
     overrides = read_overrides(page)
     if overrides:
@@ -202,14 +344,25 @@ def apply_changes(
 
     inputs = page.locator("input:visible")
     written: list[Written] = []
+    #: What each field should read back as, keyed by its Canvas label. Checked
+    #: against the live DOM before anything is saved.
+    wanted: dict[str, tuple[str, str]] = {}
 
     for field, (date_text, time_text) in changes.items():
-        if not date_text:
-            raise WriteRefused(
-                f"clearing {field} is not implemented -- emptying a date field "
-                f"needs its own handling and its own test."
-            )
         label = FIELD_LABELS[field]
+
+        # An empty date cell in a column the sheet carries means "clear this".
+        # `push.compare` has already established that the field currently holds
+        # something, so this is a real removal, not a no-op.
+        if not date_text:
+            clear_field(page, label)
+            wanted[label] = ("", "")
+            written.append(
+                Written(assignment_id=assignment_id, field=field,
+                        wanted="", typed="(cleared)", confirmed="")
+            )
+            continue
+
         moment = to_profile_time(date_text, time_text, source_tz, profile_tz)
         form_date, form_time = format_for_form(moment)
 
@@ -219,11 +372,20 @@ def apply_changes(
             box.click()
             box.fill("")
             box.type(value, delay=25)
-            # Canvas's pickers commit on blur/Enter; Escape closes the popup
-            # without discarding what was typed.
-            box.press("Enter")
-            page.wait_for_timeout(300)
+            # Escape closes the picker popup without discarding what was typed;
+            # blur is what makes the widget parse and commit it.
+            #
+            # **Enter is deliberately not used.** It commits the picker only
+            # when the picker has focus -- otherwise it submits the form.
+            # Proved live 2026-08-22: two assignments were saved by a stray
+            # Enter *after* this code had decided not to save them, so the
+            # refusal refused nothing. Both happened to be fully typed; a mid-
+            # row Enter would have written half a row.
             box.press("Escape")
+            box.evaluate("element => element.blur()")
+            page.wait_for_timeout(150)
+
+        wanted[label] = (form_date, form_time)
 
         written.append(
             Written(
@@ -233,6 +395,30 @@ def apply_changes(
                 typed=f"{form_date} {form_time}",
                 confirmed="",
             )
+        )
+
+    # **Read the form back before saving it.** A React form that re-initialises
+    # after the values were typed shows no error, saves cleanly, and writes the
+    # dates that were already there -- which is exactly what happened to four
+    # assignments on 2026-08-22. Only the post-write check caught it, and by
+    # then a wrong save had already been made. Checking here turns a silent
+    # wrong write into a refusal that writes nothing.
+    drifted = []
+    for label, (form_date, form_time) in wanted.items():
+        current = page.evaluate(_FIELD_VALUES, label)
+        if current is None:
+            drifted.append(f"{label}: its inputs are no longer on the page")
+        elif (current["date"], current["time"]) != (form_date, form_time):
+            drifted.append(
+                f"{label}: typed {form_date!r} {form_time!r}, form now holds "
+                f"{current['date']!r} {current['time']!r}"
+            )
+    if drifted:
+        snapshot = save_debug_snapshot(page, f"reverted-{assignment_id}")
+        raise WriteRefused(
+            f"assignment {assignment_id}: the form did not keep what was typed, "
+            f"so saving it would write the wrong dates -- {'; '.join(drifted)}. "
+            f"Nothing was saved. Snapshot: {snapshot}"
         )
 
     save = _save_button(page)
