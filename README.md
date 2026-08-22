@@ -188,17 +188,38 @@ bulk-shift them: `open_*` is Canvas's `unlock_at` ("Available from"), `due_*` is
   A numeric date that could be US or European is resolved US-first **and reported**; one that
   is real in only one order is read that way silently; one that is real in neither is refused.
 
-### What `push` refuses to do
-
-Each of these is refused because it is untested, not because it is hard:
+### What `push` will not do
 
 - **assignments with per-section or per-student overrides** — saving Canvas's edit form
   submits *every* date card, so a wrong move there would silently delete a student's
-  accommodation date;
-- **clearing a date**;
+  accommodation date. Untested, so refused outright;
 - **a time that does not exist**, in the hour skipped by a daylight-saving change;
 - **a date with no time, when the sheet's zone differs from the course's** — converting
-  would have to assume a time, and a different assumed time lands on a different *date*.
+  would have to assume a time, and a different assumed time lands on a different *date*;
+- **anything Canvas itself will reject.** Its rules are enforced server-side and reported
+  only on the page, so `push` both checks what it can up front and reads Canvas's answer
+  back afterwards:
+
+```
+4 row(s) have dates Canvas will not accept:
+    7289053: lock_at 2026-10-04 23:59 is before due_at 2026-10-09 23:59 -- Canvas
+             refuses this ('Until date cannot be before due date')
+    Fix these cells in the sheet; they will be skipped.
+```
+
+  Ordering is caught before any page is loaded. Other rules — dates before the term start,
+  for instance — surface as Canvas's own wording after the save attempt. Either way the row
+  is skipped and the rest of the push proceeds.
+
+**Clearing a date works**: leave the cells empty in a column the sheet carries, and `push`
+uses the form's own Clear control.
+
+### When something fails, it says why
+
+Every failure prints its reason against the line it happened on, rather than a bare count.
+A post-write mismatch distinguishes *Canvas still holds its previous value* (the save was
+rejected — its message is on the edit form) from *Canvas holds a third value* (it accepted
+the write and then altered it).
 
 After writing, `push` re-reads the assignment's own page state and compares date *and* time,
 so a save that silently did not take is reported rather than assumed.
