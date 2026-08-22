@@ -125,17 +125,20 @@ def search_course(
     # Rule 2: widen one axis at a time, in the user's stated order.
     ladder: list[tuple[Scope, str | None]] = [(scope, None)]
     current = scope
-    for relax, label in (
-        (Scope.relax_publish, "publish state"),
-        (Scope.relax_enrollment, "enrollment (current and past)"),
-        (Scope.relax_favorites, "favorites (now including unstarred courses)"),
+    for is_widest, relax, label in (
+        ("publish_is_widest", Scope.relax_publish, "publish state"),
+        ("enrollment_is_widest", Scope.relax_enrollment, "enrollment (current and past)"),
+        ("favorites_is_widest", Scope.relax_favorites,
+         "favorites (now including unstarred courses)"),
     ):
-        widened = relax(current)
-        # Skip an axis that was already wide open -- re-searching an identical
-        # set would report an "expansion" that changed nothing.
-        if widened != current:
-            ladder.append((widened, label))
-            current = widened
+        # Skip an axis already wide open -- re-searching an identical set would
+        # report an "expansion" that changed nothing. Test the *meaning*, not
+        # the object: on the symmetric axes "both flags set" and "neither set"
+        # are different Scopes that select exactly the same courses.
+        if getattr(current, is_widest):
+            continue
+        current = relax(current)
+        ladder.append((current, label))
 
     widened_by: list[str] = []
     for step_scope, label in ladder:

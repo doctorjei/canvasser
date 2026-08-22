@@ -20,9 +20,32 @@ from pathlib import Path
 
 from .auth import LoginError, ensure_logged_in, is_logged_in, quiesce
 from .browser import open_page
-from .assignments import pull_course
-from .courses import Scope, apply_scope, fetch_courses
-from .datesheet import write_sheet
+from .assignments import format_in_course_time, pull_course, read_specific
+from .courses import Scope, apply_scope, fetch_courses, fetch_one
+from .datesheet import read_sheet, write_sheet
+from .display import (
+    print_course_table,
+    render_diff,
+    render_features,
+    render_general,
+    render_nav,
+    render_sections,
+)
+from .push import (
+    FIELD_PAIRS,
+    check_course,
+    check_timezone,
+    compare,
+    to_minute,
+    describe_scope,
+)
+from .settings import fetch_settings
+from .writer import (
+    WriteFailed,
+    WriteRefused,
+    apply_changes,
+    verify,
+)
 from .selection import COURSE_VAR, CourseSelectionError, select_course
 from .config import Config, ConfigError, ENV_FILE, load_config
 from .credentials import PASSWORD_VAR, USERNAME_VAR
@@ -84,71 +107,71 @@ def cmd_courses(args: argparse.Namespace) -> int:
     return 0
 
 
-#: Column widths, to the user's spec. Every gap is two spaces; the total is 79,
-#: so the table fits an 80-column terminal without wrapping.
-#:
-#: Term is 13 because "Summer C 2026" is exactly that long. "Development Term"
-#: (16) still truncates -- covering it would cost three characters from Course
-#: Name, and those shells rarely appear in the default (favorites) view.
-COLUMNS = (("ID Num", 6), ("Fav", 3), ("Pub", 3), ("Course Name", 32),
-           ("Term", 13), ("Role(s)", 12))
-GAP = "  "
 
-BOLD_UNDERLINE_WHITE = "\033[1;4;97m"
-NORMAL_WHITE = "\033[37m"
-#: Publish state carries real consequence -- an unpublished course is invisible
-#: to students -- so it gets the loudest treatment in the table.
-BRIGHT_BOLD_GREEN = "\033[1;92m"
-BRIGHT_BOLD_RED = "\033[1;91m"
-RESET = "\033[0m"
+def _resolve_course(page, config, args):
+    """Shared course resolution: fetch once, scope, search, report widening.
 
-
-def _colors_enabled() -> bool:
-    """Colour only a real terminal, and honour NO_COLOR.
-
-    Escape codes piped into a file or a grep are noise, and this output is
-    plausibly something the user will pipe.
+    Scope governs *browsing*, not *explicit selection* -- `select_course`
+    applies the scope itself and widens it when a name finds nothing there.
     """
-    return sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    # An exact numeric id needs no search: go straight to the course. Listing
+    # every course to find one whose number we were handed is the same mistake
+    # as reading every assignment to compare one row.
+    if args.course and str(args.course).strip().isdigit():
+        direct = fetch_one(page, config, str(args.course).strip())
+        if direct is not None:
+            print(f"  Course: {direct.id}  {direct.name}  (from course id)",
+                  file=sys.stderr)
+            return direct
+        print(f"  Note: course id {args.course} did not resolve directly; "
+              f"falling back to the full list.", file=sys.stderr)
+
+    courses = fetch_courses(page, config)
+    course, source, notes = select_course(
+        courses,
+        course=args.course,
+        course_file=Path(args.course_file) if args.course_file else None,
+        scope=scope_from_args(args),
+        allow_prompt=not args.no_prompt,
+    )
+    # Report an expansion *before* acting on the result -- the user asked to
+    # know when they are getting a course from outside what they asked for.
+    for note in notes:
+        print(f"  Note: {note}", file=sys.stderr)
+    print(f"  Course: {course.id}  {course.name}  (from {source})", file=sys.stderr)
+    return course
 
 
-def _fit(text: str, width: int, centre: bool = False) -> str:
-    """Pad to width, truncating with an ellipsis rather than overflowing."""
-    text = text or ""
-    if len(text) > width:
-        # rstrip first, or a cut landing on a space leaves "Development …".
-        text = text[: width - 1].rstrip() + "…"
-    return text.center(width) if centre else text.ljust(width)
+#: Display selectors, in the order they render when several are asked for.
+#: `--general` is the default when none is named.
+DISPLAYS = (
+    ("general", render_general),
+    ("features", render_features),
+    ("sections", render_sections),
+    ("nav_active", lambda s: render_nav(s, enabled=True)),
+    ("nav_disabled", lambda s: render_nav(s, enabled=False)),
+)
 
 
-def print_course_table(courses: list) -> None:
-    header = GAP.join(_fit(label, width) for label, width in COLUMNS)
-    colour = _colors_enabled()
-    print(f"{BOLD_UNDERLINE_WHITE if colour else ''}{header}{RESET if colour else ''}")
+def cmd_settings(args: argparse.Namespace) -> int:
+    """Show a course's Details, Sections and Navigation on screen."""
+    config = config_from_args(args)
+    approver = APPROVERS[args.factor]()
 
-    for course in courses:
-        mark = "✓" if course.published else "✗"
-        state = BRIGHT_BOLD_GREEN if course.published else BRIGHT_BOLD_RED
-        pub = _fit(mark, 3, centre=True)
-        if colour:
-            # Return to the row colour after the mark, or the rest of the line
-            # would fall back to the terminal default.
-            pub = f"{state}{pub}{RESET}{NORMAL_WHITE}"
+    chosen = [name for name, _ in DISPLAYS if getattr(args, name)]
+    if not chosen:
+        chosen = ["general"]
 
-        row = GAP.join(
-            (
-                _fit(course.id, 6),
-                _fit("★" if course.favorite else "", 3, centre=True),
-                pub,
-                _fit(course.name, 32),
-                _fit(course.term, 13),
-                _fit(course.role, 12),
-            )
-        )
-        print(f"{NORMAL_WHITE if colour else ''}{row}{RESET if colour else ''}")
+    with open_page(headless=not args.headed) as page:
+        ensure_logged_in(page, config, approver)
+        course = _resolve_course(page, config, args)
+        settings = fetch_settings(page, config, course.id)
 
-    plural = "course" if len(courses) == 1 else "courses"
-    print(f"\n[{len(courses)} {plural}]")
+    for name, render in DISPLAYS:
+        if name in chosen:
+            print()
+            print("\n".join(render(settings)))
+    return 0
 
 
 def cmd_pull(args: argparse.Namespace) -> int:
@@ -159,84 +182,219 @@ def cmd_pull(args: argparse.Namespace) -> int:
     with open_page(headless=not args.headed) as page:
         ensure_logged_in(page, config, approver)
 
-        # Scope governs *browsing*, not *explicit selection*. Fetch everything
-        # once; `select_course` applies scope itself and widens it if a name
-        # finds nothing there. Both /courses tables come off one page load, so
-        # widening costs no extra navigation.
-        courses = fetch_courses(page, config)
-        course, source, notes = select_course(
-            courses,
-            course=args.course,
-            course_file=Path(args.course_file) if args.course_file else None,
-            scope=scope_from_args(args),
-            allow_prompt=not args.no_prompt,
-        )
-        # Report an expansion *before* acting on the result -- the user asked
-        # to know they are getting a course from outside what they asked for.
-        for note in notes:
-            print(f"  Note: {note}", file=sys.stderr)
-        print(f"  Course: {course.id}  {course.name}  (from {source})", file=sys.stderr)
-
-        rows = pull_course(page, config, course.id, limit=args.limit)
+        course = _resolve_course(page, config, args)
+        # One extra page load, for the timezone's human name. Canvas hands out
+        # the IANA id on every assignment page but its friendly label only on
+        # the settings page, and the sheet carries both -- the label for the
+        # person editing it, the id for push to resolve times through.
+        course_settings = fetch_settings(page, config, course.id)
+        rows, course_tz = pull_course(page, config, course.id, limit=args.limit)
 
     out_path = Path(args.out or f"dates-{course.id}.csv")
-    write_sheet(rows, out_path, course_id=course.id)
+    write_sheet(
+        rows,
+        out_path,
+        course_id=course.id,
+        timezone=course_settings.timezone_label,
+        iana=course_tz or course_settings.course_timezone,
+    )
 
-    dated = sum(1 for r in rows if r.due_at)
+    dated = sum(1 for r in rows if r.due_date)
+    opens = sum(1 for r in rows if r.open_date)
+    closes = sum(1 for r in rows if r.close_date)
     assignments = len({r.assignment_id for r in rows})
     section_rows = sum(1 for r in rows if not r.is_base_row)
 
     print(
         f"\nWrote {len(rows)} row(s) to {out_path}"
-        f"\n  {assignments} assignment(s), {section_rows} per-section row(s), "
-        f"{dated} with a due date"
+        f"\n  timezone: {course_settings.timezone_label or '(unknown)'} "
+        f"({course_tz or '?'}) -- all times are course-local, no per-value offset"
+        f"\n  {assignments} assignment(s), {section_rows} per-section row(s)"
+        f"\n  dates set: {dated} due, {opens} open, {closes} close"
     )
-    if len(rows) != dated:
-        print(f"  {len(rows) - dated} row(s) have no due date set.")
+    undated = sum(1 for r in rows if not r.has_any_date)
+    if undated:
+        print(f"  {undated} row(s) have no dates at all.")
+    return 0
+
+
+def cmd_push(args: argparse.Namespace) -> int:
+    """Compare an edited datesheet against the live course.
+
+    Preview by default; `--commit` writes. Everything up to the commit block
+    is read-only, so the common case -- running this repeatedly while editing a
+    sheet -- cannot touch the course.
+    """
+    sheet_path = Path(args.sheet)
+    sheet = read_sheet(sheet_path)
+    print(
+        f"  Sheet: {sheet_path}  (v{sheet.version or '?'}, "
+        f"course={sheet.course_id or '?'}, {len(sheet.rows)} row(s))\n"
+        f"  Times read as: {sheet.timezone or sheet.iana or 'the course zone'}\n"
+        f"  Sheet can change: {describe_scope(sheet)}",
+        file=sys.stderr,
+    )
+    # Ambiguous day/month cells are reported before anything else happens: the
+    # user can then check the two or three that mattered instead of re-reading
+    # the whole sheet, and a wrong assumption is caught before a write exists.
+    for warning in sheet.warnings:
+        print(f"  AMBIGUOUS DATE: {warning}", file=sys.stderr)
+
+    config = config_from_args(args)
+    approver = APPROVERS[args.factor]()
+    with open_page(headless=not args.headed) as page:
+        ensure_logged_in(page, config, approver)
+        # The sheet names its own course, so there is nothing to resolve --
+        # and resolving one from flags would invite pushing into the wrong
+        # class. An explicit course argument is only honoured as a cross-check.
+        course_id = args.course or sheet.course_id
+        if not course_id:
+            raise CourseSelectionError(
+                f"{sheet_path} does not record a course and none was given. "
+                f"Re-run `canvasser pull` to regenerate it with a header."
+            )
+        check_course(sheet, course_id)
+
+        # Straight to the assignments the sheet names. Reading the whole
+        # course to compare a handful of rows cost ~90s of page loads to learn
+        # nothing about the other 30-odd.
+        targets = sorted({row.assignment_id for row in sheet.rows})
+        print(
+            f"\n  Reading {len(targets)} assignment(s) named by the sheet. "
+            f"This is the read pass -- nothing is being changed.\n",
+            file=sys.stderr,
+        )
+        current, course_tz = read_specific(page, config, course_id, targets)
+
+    # The sheet's times are bare wall clocks; its `iana=` header is the only
+    # thing that says what they mean. Checked before the diff, because a zone
+    # change makes every comparison in it meaningless.
+    check_timezone(sheet, course_tz)
+
+    diff = compare(sheet, current)
+    print()
+    print("\n".join(render_diff(diff, sheet)))
+
+    if not args.commit:
+        return 0 if diff.is_empty else 1
+    if diff.is_empty:
+        print("\nNothing to commit.")
+        return 0
+
+    # Everything above this line is read-only. Everything below writes.
+    source_tz = sheet.iana or course_tz
+    if not source_tz:
+        raise ConfigError(
+            "No timezone for the sheet's times: row 1 has no `iana=` and the "
+            "course did not report one. Re-run `canvasser pull` to regenerate "
+            "the sheet with a header."
+        )
+
+    by_key = sheet.by_key()
+    print(f"\nCommitting to course {course_id}. Times read as {source_tz}.")
+    failures = 0
+    with open_page(headless=not args.headed) as page:
+        ensure_logged_in(page, config, approver)
+        for row in diff.changed:
+            wanted = by_key[row.key]
+            if not wanted.is_base_row:
+                print(f"  SKIP {row.title}: override rows are not written yet.",
+                      file=sys.stderr)
+                failures += 1
+                continue
+            changes = {
+                change.field: (
+                    getattr(wanted, date_column), getattr(wanted, time_column)
+                )
+                for change in row.changes
+                for field, date_column, time_column in FIELD_PAIRS
+                if field == change.field
+            }
+            try:
+                apply_changes(page, config, course_id, row.key[0], changes, source_tz)
+                after = verify(page, config, course_id, row.key[0])
+            except (WriteRefused, WriteFailed) as exc:
+                print(f"  REFUSED {row.title}: {exc}", file=sys.stderr)
+                failures += 1
+                continue
+            print(f"  {row.title}  #{row.key[0]}")
+            for field, _, _ in FIELD_PAIRS:
+                if field in changes:
+                    got = format_in_course_time(after.get(field) or "", course_tz)
+                    asked = " ".join(p for p in changes[field] if p)
+                    # Compare date AND time. An earlier version tested only
+                    # `startswith(date)`, which would have reported OK for a
+                    # value written an hour -- or fourteen hours -- off, which
+                    # is the exact failure the timezone handling exists to
+                    # prevent. The offset suffix is dropped before comparing;
+                    # the sheet does not carry one.
+                    # Minute precision: Canvas keeps its own seconds and the
+                    # form cannot express them. See push.to_minute.
+                    ok = to_minute(got.rsplit(" ", 1)[0]) == to_minute(asked)
+                    print(f"      {field:<11}{asked:<22} -> Canvas now: {got}"
+                          f"   {'OK' if ok else 'MISMATCH'}")
+                    failures += 0 if ok else 1
+
+    if failures:
+        print(f"\n{failures} field(s)/row(s) did not land. Nothing was retried.",
+              file=sys.stderr)
+        return 2
+    print("\nCommitted.")
     return 0
 
 
 def add_scope_args(parser: argparse.ArgumentParser) -> None:
-    """Three independent scope axes, shared by `courses` and `pull`.
+    """Three independent scope axes, shared by `courses`, `pull`, `settings`.
 
-    Only the favorite axis defaults to a winnowed field; that is deliberate --
-    it is the axis the user curates in Canvas itself.
+    **Opposed flags union rather than conflict.** `--active --archived` asks
+    for both, which is what the words say; an earlier version made each pair
+    mutually exclusive and errored instead. Only the favorite axis defaults to
+    a winnowed field -- deliberately, it is the axis the user curates in
+    Canvas itself.
     """
     scope = parser.add_argument_group(
         "scope",
-        "Three independent axes. Enrollment defaults to both active and "
-        "archived; publish state defaults to any; favorites are the one "
-        "winnowed default -- use --all to include non-favorites.",
+        "Three independent axes. Naming both sides of an axis unions them "
+        "(--active --archived is every enrollment). Enrollment and publish "
+        "state default to everything; favorites are the one winnowed default.",
     )
-    enrollment = scope.add_mutually_exclusive_group()
-    enrollment.add_argument(
-        "--active", action="store_true", help="only current enrollments"
+    scope.add_argument("--active", action="store_true", help="current enrollments")
+    scope.add_argument("--archived", action="store_true", help="past enrollments")
+    scope.add_argument("--published", action="store_true", help="published courses")
+    scope.add_argument("--unpublished", action="store_true", help="unpublished courses")
+    scope.add_argument(
+        "--favorite", action="store_true", help="starred courses (the default)"
     )
-    enrollment.add_argument(
-        "--archived", action="store_true", help="only past enrollments"
+    scope.add_argument(
+        "--unmarked", action="store_true", help="only courses NOT starred in Canvas"
     )
-
-    state = scope.add_mutually_exclusive_group()
-    state.add_argument("--published", action="store_true", help="only published courses")
-    state.add_argument(
-        "--unpublished", action="store_true", help="only unpublished courses"
-    )
-
     scope.add_argument(
         "--all",
-        dest="include_non_favorites",
+        dest="all_courses",
         action="store_true",
-        help="include courses that are not starred in Canvas",
+        help="everything: both sides of all three axes",
     )
 
 
 def scope_from_args(args: argparse.Namespace) -> Scope:
+    """Build a Scope from parsed flags.
+
+    `--all` names **both sides of every axis** (user, 2026-08-21), so it is the
+    widest possible scope rather than a favorites-only shorthand.
+
+    Consequence worth knowing: because opposed flags union, pairing `--all`
+    with a narrowing flag does not narrow anything -- `--all --published` is
+    every course, not every published course, since `--all` has already named
+    `--unpublished` too. That falls straight out of the union rule.
+    """
+    everything = args.all_courses
     return Scope(
-        active=args.active,
-        archived=args.archived,
-        published=args.published,
-        unpublished=args.unpublished,
-        include_non_favorites=args.include_non_favorites,
+        active=args.active or everything,
+        archived=args.archived or everything,
+        published=args.published or everything,
+        unpublished=args.unpublished or everything,
+        favorite=args.favorite or everything,
+        unmarked=args.unmarked or everything,
     )
 
 
@@ -309,6 +467,60 @@ def build_parser() -> argparse.ArgumentParser:
     pull.add_argument(
         "--limit", type=int, help="only the first N assignments (for a quick check)"
     )
+
+    settings = sub.add_parser(
+        "settings",
+        help="show a course's Details, Sections and Navigation",
+        description="Reads the Settings page and prints Course Details, "
+        "Sections, and which navigation items students can actually see. "
+        "Course may be an id or a name fragment, resolved exactly as `pull` "
+        "does.",
+    )
+    settings.add_argument(
+        "course", nargs="?", help="course id or name fragment (see: canvasser courses)"
+    )
+    settings.add_argument(
+        "--course-file", metavar="PATH", help="read the course id/name from a file"
+    )
+    shown = settings.add_argument_group(
+        "displays",
+        "Choose one or more. With none named, --general is shown.",
+    )
+    shown.add_argument(
+        "--general", action="store_true", help="course information (the default)"
+    )
+    shown.add_argument(
+        "--features", action="store_true", help="features, interface and visibility"
+    )
+    shown.add_argument("--sections", action="store_true", help="section information")
+    shown.add_argument(
+        "--nav-active", dest="nav_active", action="store_true",
+        help="enabled navigation elements",
+    )
+    shown.add_argument(
+        "--nav-disabled", dest="nav_disabled", action="store_true",
+        help="disabled navigation elements",
+    )
+    add_scope_args(settings)
+
+    push = sub.add_parser(
+        "push",
+        help="compare an edited datesheet against the live course",
+        description="Reads a datesheet, re-reads the course, and reports what "
+        "would change. Writes nothing: this is the preview half of the round "
+        "trip, and pull -> push with no edits must report zero changes.",
+    )
+    push.add_argument("sheet", help="path to a datesheet CSV")
+    push.add_argument(
+        "--course", help="cross-check: refuse if the sheet names a different course"
+    )
+    push.add_argument(
+        "--limit", type=int, help="only the first N assignments (for a quick check)"
+    )
+    push.add_argument(
+        "--commit", action="store_true",
+        help="actually write the changes (default is preview only)",
+    )
     return parser
 
 
@@ -319,6 +531,8 @@ def main(argv: list[str] | None = None) -> int:
         "login": cmd_login,
         "courses": cmd_courses,
         "pull": cmd_pull,
+        "settings": cmd_settings,
+        "push": cmd_push,
     }
     try:
         return handlers[args.command](args)

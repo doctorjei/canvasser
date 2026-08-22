@@ -77,31 +77,50 @@ class Course:
 class Scope:
     """The three independent scope axes, as the user set them.
 
+    Each axis is a **pair of opposed flags, combined as a union**: naming both
+    sides asks for both, it is not a contradiction. `--active --archived` means
+    every enrollment, exactly as omitting both does. An earlier version made
+    each pair argparse-mutually-exclusive so the combination errored out; the
+    user's call (2026-08-21) is that a union is the obvious reading and
+    refusing it is unhelpful.
+
+    So per axis: neither flag = that axis's default, one flag = narrow to it,
+    both flags = open it up.
+
+    The favourite axis is the one whose *default* is winnowed -- it is the axis
+    the user curates in Canvas itself -- which is why `--unmarked` (only
+    unstarred) and `--favorite` (only starred) both exist even though
+    `--favorite` matches the default. `--all` is shorthand for naming both.
+
     Kept as a value object rather than loose kwargs because the name search
     *relaxes* scope one axis at a time and has to report which axis it widened.
-    Booleans mirror the flags: `active`/`archived` are "only that"; both false
-    means both. Favourite is the one winnowed default, so its flag opens it up.
     """
 
     active: bool = False
     archived: bool = False
     published: bool = False
     unpublished: bool = False
-    include_non_favorites: bool = False
+    favorite: bool = False
+    unmarked: bool = False
 
     # Each axis reports whether it is already as wide as it goes, so the search
     # can skip a relaxation that would re-search an identical set.
+    #
+    # For the two symmetric axes, "both set" and "neither set" are the same
+    # request -- everything -- so equality is the test, not falsity.
     @property
     def publish_is_widest(self) -> bool:
-        return not self.published and not self.unpublished
+        return self.published == self.unpublished
 
     @property
     def enrollment_is_widest(self) -> bool:
-        return not self.active and not self.archived
+        return self.active == self.archived
 
     @property
     def favorites_is_widest(self) -> bool:
-        return self.include_non_favorites
+        # Not symmetric: neither flag means favourites only, so only naming
+        # both sides genuinely opens this axis.
+        return self.favorite and self.unmarked
 
     @property
     def is_widest(self) -> bool:
@@ -118,24 +137,25 @@ class Scope:
         return replace(self, active=False, archived=False)
 
     def relax_favorites(self) -> Scope:
-        return replace(self, include_non_favorites=True)
+        return replace(self, favorite=True, unmarked=True)
 
     def describe(self) -> str:
         """Human-readable scope, for the expansion notice."""
         parts = []
-        if self.active:
-            parts.append("current enrollments")
-        elif self.archived:
-            parts.append("past enrollments")
-        else:
+        if self.enrollment_is_widest:
             parts.append("all enrollments")
-        if self.published:
-            parts.append("published only")
-        elif self.unpublished:
-            parts.append("unpublished only")
-        parts.append(
-            "all courses" if self.include_non_favorites else "favorites only"
-        )
+        else:
+            parts.append("current enrollments" if self.active else "past enrollments")
+
+        if not self.publish_is_widest:
+            parts.append("published only" if self.published else "unpublished only")
+
+        if self.favorites_is_widest:
+            parts.append("starred and unstarred")
+        elif self.unmarked:
+            parts.append("unstarred only")
+        else:
+            parts.append("favorites only")
         return ", ".join(parts)
 
 
@@ -144,9 +164,10 @@ def apply_scope(courses: list[Course], scope: Scope) -> list[Course]:
 
     Each axis has its own default, and only one of them is winnowed:
 
-        enrollment   default BOTH; --active or --archived narrows it
-        published    default ANY;  --published or --unpublished narrows it
-        favorite     default FAVORITES ONLY; --all opens it up
+        enrollment   default BOTH; --active / --archived narrows, both = union
+        published    default ANY;  --published / --unpublished ditto
+        favorite     default FAVORITES ONLY; --unmarked flips it,
+                     --favorite --unmarked (or --all) opens it
 
     Favourite is the deliberate exception -- it is the axis that reflects what
     the user actually cares about right now, and it is a knob they already
@@ -155,16 +176,15 @@ def apply_scope(courses: list[Course], scope: Scope) -> list[Course]:
     Separated from fetching so the name search can widen scope repeatedly
     without re-visiting /courses; both tables come off a single page load.
     """
-    if scope.active:
-        courses = [c for c in courses if not c.archived]
-    if scope.archived:
-        courses = [c for c in courses if c.archived]
-    if not scope.include_non_favorites:
-        courses = [c for c in courses if c.favorite]
-    if scope.published:
-        courses = [c for c in courses if c.published]
-    if scope.unpublished:
-        courses = [c for c in courses if not c.published]
+    # Exactly one side of a pair means "narrow to that side". Naming both (or
+    # neither) is a union, so there is nothing to filter.
+    if not scope.enrollment_is_widest:
+        courses = [c for c in courses if c.archived == scope.archived]
+    if not scope.publish_is_widest:
+        courses = [c for c in courses if c.published == scope.published]
+    if not scope.favorites_is_widest:
+        # Default (neither flag) and an explicit --favorite are the same ask.
+        courses = [c for c in courses if c.favorite != scope.unmarked]
     return courses
 
 
@@ -237,3 +257,34 @@ def _scrape_table(
         )
 
     return courses
+
+
+def fetch_one(page: Page, config: Config, course_id: str) -> Course | None:
+    """Load a single course directly by id, without listing anything.
+
+    When the caller already has the number there is nothing to search for, and
+    scraping ~200 rows off /courses to find a row we could have navigated to is
+    a page load and a lot of parsing spent on a question already answered.
+
+    Returns None if the id does not resolve, so the caller can fall back to the
+    full list rather than treating a typo as a hard failure. Term and role are
+    not on this page; they are left blank rather than guessed, because nothing
+    downstream of an explicit id needs them.
+    """
+    page.goto(
+        f"{config.base_url}/courses/{course_id}", wait_until="domcontentloaded"
+    )
+    found = page.evaluate(
+        """() => {
+            const c = window.ENV?.current_context;
+            if (!c || c.type !== 'Course' || !c.id) return null;
+            return {id: String(c.id), name: c.name || '',
+                    published: window.ENV?.COURSE_PUBLISHED !== false};
+        }"""
+    )
+    if not found or found["id"] != str(course_id):
+        return None
+    return Course(
+        id=found["id"], name=found["name"], term="", role="",
+        published=bool(found["published"]),
+    )

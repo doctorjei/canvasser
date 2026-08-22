@@ -8,21 +8,26 @@ support](https://elearning.ufl.edu/instructor-help/api-tokens/) after Instructur
 capping non-admin tokens at 30 days, and advises retiring token-based scripts. Browser
 automation is the better-supported path for this institution.
 
-> **Status: working, read-only.** Login, session reuse, course listing, and pulling
-> assignment due dates to CSV all work against the live site. Nothing writes to Canvas yet —
-> `push` (applying an edited CSV back) is the next piece.
+> **Status: the round trip works, live.** Dates pulled to CSV, edited in a spreadsheet, and
+> written back to Canvas — verified against a real course, for both plain assignments and
+> classic quizzes. Writing is opt-in (`--commit`) and every write is read back and checked.
 
 ## What it does
 
-The goal is a round trip: **pull dates to a CSV, edit them in a spreadsheet, push them
-back.** The read half exists.
+A round trip: **pull dates to a CSV, edit them in a spreadsheet, push them back.**
 
 ```bash
 canvasser status                      # is the stored session still authenticated?
 canvasser login                       # authenticate (GatorLink + Duo)
 canvasser courses                     # list courses, with ids
-canvasser pull "Wednesday Fall 26"    # assignment due dates -> CSV
+canvasser settings 580777             # course details, sections, navigation
+canvasser pull 580777                 # assignment dates -> CSV
+canvasser push dates-580777.csv       # show what would change; writes nothing
+canvasser push dates-580777.csv --commit   # actually write it
 ```
+
+`push` previews by default. Running it repeatedly while editing a sheet cannot touch the
+course; only `--commit` writes.
 
 ## Requirements
 
@@ -52,7 +57,7 @@ it lands in shell history and `/proc/<pid>/cmdline` is world-readable. For scrip
 `sshpass` answers the prompt, exactly as it does for `ssh`:
 
 ```bash
-sshpass -f ~/.canvas-pw canvasser --username jjb pull 574855
+sshpass -f ~/.canvas-pw canvasser --username jjb pull 580777
 ```
 
 Prompts read `/dev/tty`, not stdin, so this works even when stdin is a pipe. `--no-prompt`
@@ -79,9 +84,10 @@ need no interaction at all.
 |------|---------|-------|
 | enrollment | both active and archived | `--active` / `--archived` |
 | publish state | any | `--published` / `--unpublished` |
-| favorite | **favorites only** | `--all` to include the rest |
+| favorite | **favorites only** | `--favorite` / `--unmarked`; `--all` opens every axis |
 
-Favorites is the one deliberately narrowed default — it is the list you curate in Canvas
+**Naming both sides of an axis unions them** — `--active --archived` is every enrollment,
+which is what the words say. Favorites is the one deliberately narrowed default — it is the list you curate in Canvas
 itself, via the star on the Courses page. Canvas's own "Current Enrollments" is not a useful
 definition of current: on a long-lived account it is mostly sandboxes and dev shells.
 
@@ -89,30 +95,56 @@ definition of current: on a long-lived account it is mostly sandboxes and dev sh
 than a guess. Omit it entirely for an interactive picker:
 
 ```bash
-canvasser pull 574855
-canvasser pull "Wednesday Fall 26"
+canvasser pull 580777
+canvasser pull "Comp Engr Design"
 canvasser pull --course-file ~/current-class.txt
-CANVASSER_COURSE=574855 canvasser pull
+CANVASSER_COURSE=580777 canvasser pull
 canvasser pull                          # numbered picker
 ```
 
 ## The datesheet CSV
 
 ```
-# canvasser datesheet v2 course=574855
-assignment_id,override_id,title,assign_to,due_at
-7256241,818682,Civil Quiz,EGS1006-02F3(11989),2026-09-02 18:00 -0400
-7256241,,Civil Quiz,Everyone else,
+# canvasser datesheet v3.1,,course=580777,timezone=Eastern Time (US & Canada),,,,iana=America/New_York,,
+Assignment Details,,,,unlock_at,,due_at,,lock_at,
+assignment_id,override_id,title,assign_to,open_date,open_time,due_date,due_time,close_date,close_time
+7289050,,01 - Equipment Demonstration,Everyone,2026-08-21,00:00,2026-08-28,23:59,2026-09-02,23:59
 ```
 
-- **Only `due_at` is editable.** The other columns are for orientation and matching.
-- One row per **assign-to target**: an assignment with per-section dates gets one row per
-  section, plus a base row (empty `override_id`).
-- Rows are matched on `(assignment_id, override_id)`, never on title — so renaming an
-  assignment in the spreadsheet cannot retarget a write.
-- Dates are in **course time with an explicit offset** (`2026-11-30 23:59:59 -0500`). An
-  assignment has no timezone of its own; Canvas stores one instant and renders it per viewer,
-  so the offset is what makes the value unambiguous across DST.
+Three date fields, each split into a **date column and a time column** so a spreadsheet can
+bulk-shift them: `open_*` is Canvas's `unlock_at` ("Available from"), `due_*` is `due_at`,
+`close_*` is `lock_at` ("Until").
+
+- **Only `assignment_id` is required.** Delete any other column, any row, and both preamble
+  rows — the file still reads. Columns are matched by name, so order does not matter either.
+- **An absent column means "leave this alone"; an empty cell means "clear it".** Deleting the
+  `close_*` columns will not wipe your lock dates.
+- Rows are matched on `(assignment_id, override_id)`, never on title — renaming an assignment
+  in the spreadsheet cannot retarget a write.
+- **The timezone is declared once, in row 1, twice over**: `timezone=` is Canvas's familiar
+  name for people, `iana=` is the identifier `push` resolves wall clocks through. Values
+  themselves carry no offset.
+- **Times are minute-only.** Canvas's time box has no seconds field, so seconds cannot be
+  written; `11:59 PM` is what a person types and Canvas applies its own `:59`. Seconds you
+  type are accepted and dropped.
+- **Dates and times are read forgivingly**, because spreadsheets reformat them:
+  `2026-02-01`, `2/1/2026`, `1 Feb 2026`, `2026年2月1日`; `23:59`, `11:59 PM`, `2359`.
+  A numeric date that could be US or European is resolved US-first **and reported**; one that
+  is real in only one order is read that way silently; one that is real in neither is refused.
+
+### What `push` refuses to do
+
+Each of these is refused because it is untested, not because it is hard:
+
+- **assignments with per-section or per-student overrides** — saving Canvas's edit form
+  submits *every* date card, so a wrong move there would silently delete a student's
+  accommodation date;
+- **clearing a date**;
+- **a sheet whose timezone no longer matches the course's** — it tells you to re-pull;
+- **a time that does not exist**, in the hour skipped by a daylight-saving change.
+
+After writing, `push` re-reads the assignment's own page state and compares date *and* time,
+so a save that silently did not take is reported rather than assumed.
 
 ## Data handling
 
