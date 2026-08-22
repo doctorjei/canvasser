@@ -1,6 +1,7 @@
 """Terminal rendering for course information.
 
-Layout and colour are the user's spec; see `workbook/designs/display-spec.md`,
+Layout and colour are the user's spec; see `designs/display-spec.md` in the
+project's own notes (not shipped with the package),
 which is authoritative. Widths here are load-bearing -- every table is sized to
 fit an 80-column terminal without wrapping.
 

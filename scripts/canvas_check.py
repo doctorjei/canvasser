@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """Verify Canvas API credentials and report what the token can see.
 
-Reads CANVAS_BASE_URL / CANVAS_API_TOKEN from ~/vault/rw/secrets/canvas.env
+SUPERSEDED. The project drives a browser, not the REST API -- UF discontinued
+token support and the full round trip works without one. Kept because it is
+still the cheapest way to check a token if one ever exists.
+
+Reads CANVAS_BASE_URL / CANVAS_API_TOKEN from the same secrets file canvasser
+uses (canvasser.config.state_dir()), overridable with --env-file
 (or from the environment, which wins). Prints the authenticated user, the
 token's scope/expiry as Canvas reports it, and the active courses it can
 reach -- enough to confirm creds work before building anything on top.
@@ -17,7 +22,10 @@ from pathlib import Path
 
 import requests
 
-DEFAULT_ENV_FILE = Path.home() / "vault" / "rw" / "secrets" / "canvas.env"
+try:                                    # keep this runnable standalone
+    from canvasser.config import ENV_FILE as DEFAULT_ENV_FILE
+except ImportError:                     # pragma: no cover
+    DEFAULT_ENV_FILE = Path.home() / ".local/state/canvasser/canvas.env"
 
 
 def load_env_file(path: Path) -> dict[str, str]:

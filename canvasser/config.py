@@ -128,8 +128,9 @@ def load_config(
 ) -> Config:
     """Resolve credentials from every supported source, by precedence.
 
-    Defaults preserve the original behavior (vault file, env vars win over it),
-    so callers that pass nothing keep working.
+    Defaults preserve the original behaviour (the state directory's secrets
+    file, with environment variables winning over it), so callers that pass
+    nothing keep working.
     """
     resolved_user, resolved_pass = resolve_credentials(
         username=username,
@@ -139,7 +140,8 @@ def load_config(
     )
 
     # base_url is not a secret, so its resolution stays simple: explicit
-    # secrets file, then environment, then the vault file, then the default.
+    # secrets file, then environment, then the state directory's file, then
+    # the default.
     file_values = parse_env_file(secrets_file) if secrets_file else {}
     base_url = (
         file_values.get("CANVAS_BASE_URL")
