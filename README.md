@@ -8,9 +8,16 @@ support](https://elearning.ufl.edu/instructor-help/api-tokens/) after Instructur
 capping non-admin tokens at 30 days, and advises retiring token-based scripts. Browser
 automation is the better-supported path for this institution.
 
-> **Status: the round trip works, live.** Dates pulled to CSV, edited in a spreadsheet, and
-> written back to Canvas — verified against a real course, for both plain assignments and
-> classic quizzes. Writing is opt-in (`--commit`) and every write is read back and checked.
+> **Status: in use.** A full semester of dates for a real course — 37 assignments, set and
+> cleared — pulled to CSV, edited in a spreadsheet, and written back, ending in
+> `No changes. 37 sheet row(s) match Canvas exactly.` Plain assignments and classic quizzes
+> both. Writing is opt-in (`--commit`), and every field is checked three times: the typed
+> values are read back out of the form before saving, Canvas's own error messages are read
+> after, and the stored value is re-read from the page's state afterwards.
+>
+> **Not supported:** assignments with per-student or per-section overrides. Saving Canvas's
+> edit form submits *every* date card, so getting that wrong deletes an accommodation date.
+> It is refused rather than attempted.
 
 ## What it does
 

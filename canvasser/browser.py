@@ -26,7 +26,7 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
-from .config import PROFILE_DIR, SESSION_STATE_FILE
+from .config import PROFILE_DIR, SESSION_STATE_FILE, state_dir
 
 
 class BrowserUnavailable(RuntimeError):
@@ -215,7 +215,13 @@ def save_debug_snapshot(page: Page, label: str, directory: Path | None = None) -
     Headless means we cannot simply look at the screen, so anything that fails
     in an unexpected place needs to leave evidence behind.
     """
-    directory = directory or Path.home() / "canon" / "workbook" / "temp" / "snapshots"
+    # Under the state directory, not a path invented here. An earlier version
+    # wrote to ~/canon/workbook/temp/snapshots -- meaningful only inside the
+    # sandbox this was built in, and it created that tree on a real user's
+    # laptop. Snapshots render whole Canvas pages and can contain student data,
+    # so the mode-700 state directory is also the right place for them on
+    # sensitivity grounds.
+    directory = directory or state_dir() / "snapshots"
     directory.mkdir(parents=True, exist_ok=True)
     stem = directory / label
     page.screenshot(path=f"{stem}.png", full_page=True)
