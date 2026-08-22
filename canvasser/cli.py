@@ -42,6 +42,7 @@ from .push import (
     FIELD_PAIRS,
     align_timezone,
     check_course,
+    check_order,
     compare,
     to_minute,
     describe_scope,
@@ -335,8 +336,21 @@ def cmd_push(args: argparse.Namespace) -> int:
     print()
     print("\n".join(render_diff(diff, sheet)))
 
+    # Rows Canvas will reject on sight. Reported with the diff so they are
+    # visible in a dry run, and skipped at commit rather than costing an edit
+    # page load each to attempt a save that cannot succeed.
+    out_of_order = check_order(sheet, current)
+    if out_of_order:
+        print(f"\n  {len(out_of_order)} row(s) have dates Canvas will not accept:",
+              file=sys.stderr)
+        for problem in out_of_order:
+            print(f"      {problem}", file=sys.stderr)
+        print("      Fix these cells in the sheet; they will be skipped.",
+              file=sys.stderr)
+    blocked = {problem.split(":")[0] for problem in out_of_order}
+
     if not args.commit:
-        return 0 if diff.is_empty else 1
+        return 1 if (out_of_order or not diff.is_empty) else 0
     if diff.is_empty:
         print("\nNothing to commit.")
         return 0
@@ -361,6 +375,11 @@ def cmd_push(args: argparse.Namespace) -> int:
             if not wanted.is_base_row:
                 print(f"  SKIP {row.title}: override rows are not written yet.",
                       file=sys.stderr)
+                failures += 1
+                continue
+            if row.key[0] in blocked:
+                print(f"  SKIP {row.title}: its dates are out of order and "
+                      f"Canvas would refuse the save.", file=sys.stderr)
                 failures += 1
                 continue
             changes = {

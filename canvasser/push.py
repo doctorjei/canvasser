@@ -192,6 +192,65 @@ def compare(sheet: Sheet, current: list[AssignmentRow]) -> Diff:
     )
 
 
+#: Canvas's ordering rule for the three dates, and the wording it rejects with.
+#: Equal values are fine -- a course really does set due and until to the same
+#: instant -- so only strictly-before is an error.
+DATE_ORDER = (
+    ("unlock_at", "due_at", "Due date cannot be before unlock date"),
+    ("due_at", "lock_at", "Until date cannot be before due date"),
+    ("unlock_at", "lock_at", "Until date cannot be before unlock date"),
+)
+
+
+def _effective(row: AssignmentRow, live: AssignmentRow | None, sheet: Sheet) -> dict:
+    """What each date would be *after* the push, as a comparable string.
+
+    The sheet may name only some of the three. A column it does not carry
+    keeps whatever Canvas holds, so ordering has to be judged on the mixture --
+    checking the sheet alone would miss a new due date that lands after an
+    existing until date, which is the commonest way to trip this.
+    """
+    out = {}
+    for field, date_column, time_column in FIELD_PAIRS:
+        if sheet.specifies(date_column) or sheet.specifies(time_column):
+            source = row
+        elif live is not None:
+            source = live
+        else:
+            continue
+        out[field] = to_minute(_joined(source, date_column, time_column))
+    return out
+
+
+def check_order(sheet: Sheet, current: list[AssignmentRow]) -> list[str]:
+    """Rows Canvas will refuse because their dates are out of order.
+
+    **Found the hard way, 2026-08-22.** Four rows of a full-class push reported
+    a bare "MISMATCH" after the write; the cause was that each asked for an
+    until date *before* its due date. Canvas rejected every one with "Until
+    date cannot be before due date", re-rendered the form unchanged, and the
+    post-write check dutifully reported that nothing had changed -- without
+    ever mentioning the error Canvas was displaying.
+
+    Catching it here costs nothing: it is arithmetic on values already in hand,
+    it names the cell to fix, and it saves loading an edit page per row to
+    attempt a save that cannot succeed.
+    """
+    live = {row.key: row for row in current}
+    problems = []
+    for row in sheet.rows:
+        dates = _effective(row, live.get(row.key), sheet)
+        for earlier, later, complaint in DATE_ORDER:
+            first, second = dates.get(earlier), dates.get(later)
+            if first and second and second < first:
+                problems.append(
+                    f"{row.assignment_id}: {later} {second} is before "
+                    f"{earlier} {first} -- Canvas refuses this "
+                    f"({complaint!r})"
+                )
+    return problems
+
+
 def check_course(sheet: Sheet, course_id: str) -> None:
     """Refuse a sheet that came from a different course.
 

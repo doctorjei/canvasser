@@ -221,6 +221,23 @@ _MARK_CLEAR = """(label) => {
 }"""
 
 
+#: Field-level validation messages, deduplicated.
+#:
+#: InstUI nests the same text through several elements
+#: (`formFieldMessages` > `formFieldMessages__message` > `formFieldMessage`),
+#: so the live page shows one complaint three times. Observed 2026-08-22:
+#: "Until date cannot be before due date", x3.
+_FIELD_MESSAGES = """() => {
+    const seen = new Set();
+    document.querySelectorAll('[class*="formFieldMessage"]').forEach(e => {
+        if (e.offsetParent === null) return;
+        const text = (e.textContent || '').replace(/\\s+/g, ' ').trim();
+        if (text) seen.add(text);
+    });
+    return [...seen];
+}"""
+
+
 def clear_field(page: Page, label: str) -> None:
     """Empty one date row using the form's own Clear control.
 
@@ -430,6 +447,26 @@ def apply_changes(
     save.click()
     page.wait_for_load_state("domcontentloaded")
     page.wait_for_timeout(2_000)
+
+    # **A rejected save looks exactly like a successful one from here.** Canvas
+    # answers a validation failure by staying on the form and rendering a
+    # field message; nothing throws, nothing navigates. Four rows were reported
+    # as written on 2026-08-22 when Canvas had refused all four with "Until
+    # date cannot be before due date", and only the post-write ENV comparison
+    # noticed. Reading Canvas's own words back is both earlier and clearer.
+    #
+    # The two signals are required together: a successful save leaves the edit
+    # page, and a failed one leaves messages behind. Either alone gives false
+    # positives -- InstUI renders hints through the same component.
+    if "/edit" in page.url:
+        complaints = page.evaluate(_FIELD_MESSAGES)
+        if complaints:
+            snapshot = save_debug_snapshot(page, f"rejected-{assignment_id}")
+            raise WriteFailed(
+                f"Canvas refused the save for assignment {assignment_id}: "
+                f"{'; '.join(complaints)}. Nothing was changed. "
+                f"Snapshot: {snapshot}"
+            )
     return written
 
 
