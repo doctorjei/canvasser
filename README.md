@@ -168,11 +168,18 @@ bulk-shift them: `open_*` is Canvas's `unlock_at` ("Available from"), `due_*` is
 - **The timezone is declared once, in row 1, twice over**: `timezone=` is Canvas's familiar
   name for people, `iana=` is the identifier `push` resolves wall clocks through. Values
   themselves carry no offset.
-- **`iana=` says what zone the sheet's own times are written in** — nothing more. If it is
-  not the course's zone, `push` converts every value into course time before comparing or
+- **The declared zone says what the sheet's own times are written in** — nothing more. If it
+  is not the course's zone, `push` converts every value into course time before comparing or
   writing, preserving the *instant*, and prints what it did. A sheet edited in Tokyo saying
   `2026-08-29 12:59` and a New York course holding `2026-08-28 23:59` are the same deadline.
-  If `iana=` is missing, the times are taken to be course-local already.
+- **`iana=` wins, but `timezone=` is a real fallback.** Canvas is Rails, so
+  `Eastern Time (US & Canada)` is an `ActiveSupport::TimeZone` name and maps to an IANA zone;
+  if you delete `iana=` the friendly label still resolves. All 153 of Canvas's labels are
+  recognised, including the ones IANA has since renamed (Kyiv, Greenland, Rangoon), and a
+  label with Canvas's offset pair still attached is accepted. A label that cannot be read is
+  **reported**, not silently ignored. Note `EST` and `-05:00` deliberately do *not* resolve:
+  one names half a year, the other says nothing about DST.
+- With no zone declared at all, the times are taken to be course-local already.
 - **Times are minute-only.** Canvas's time box has no seconds field, so seconds cannot be
   written; `11:59 PM` is what a person types and Canvas applies its own `:59`. Seconds you
   type are accepted and dropped.

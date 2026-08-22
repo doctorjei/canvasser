@@ -325,7 +325,9 @@ def cmd_push(args: argparse.Namespace) -> int:
     # thing that says what they mean. If that is not the course's zone, convert
     # now -- before the diff, so both sides of every comparison, the values
     # typed into the form, and the post-write check all speak course time.
-    sheet, realigned = align_timezone(sheet, course_tz)
+    sheet, realigned, zone_warnings = align_timezone(sheet, course_tz)
+    for warning in zone_warnings:
+        print(f"\n  UNREADABLE TIMEZONE: {warning}", file=sys.stderr)
     if realigned:
         print(f"\n  {realigned.describe()}", file=sys.stderr)
 

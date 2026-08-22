@@ -22,10 +22,13 @@ moment but are not the same cell, and a diff that called them equal would hide
 a real formatting drift in `pull`.
 
 That only works if both sides are in the same zone, which is what
-`align_timezone` guarantees before anything is compared: a sheet whose `iana=`
-differs from the course's zone is converted into course time first. `iana=`
+`align_timezone` guarantees before anything is compared: a sheet whose declared
+zone differs from the course's is converted into course time first. That zone
 declares what the sheet's wall clocks *mean*, so a disagreement is a
 conversion, not an error.
+
+The zone comes from `iana=` when present, and otherwise from the friendly
+`timezone=` label -- see `sheet_zone`.
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ from dataclasses import dataclass, replace
 
 from .dateparse import convert
 from .datesheet import AssignmentRow, Sheet, SheetError
+from .timezones import resolve_friendly
 
 #: The three date pairs, grouped for reporting. Canvas's field name first,
 #: because that is what the sheet's row 2 labels them and what a later write
@@ -207,27 +211,66 @@ def check_course(sheet: Sheet, course_id: str) -> None:
 class Realignment:
     """A record of converting a sheet's times into the course's zone."""
 
-    source: str      # the sheet's `iana=`
+    source: str      # the zone the sheet's times were read as
     target: str      # the course's own zone
     cells: int       # how many date/time pairs moved
     example: str     # one of them, both ways round, for the user to sanity-check
+    #: How `source` was determined -- "iana=" or the friendly label it came
+    #: from. Shown because a zone derived from a label is a step further from
+    #: what the file literally said, and the user should be able to see that.
+    via: str = "iana="
 
     def describe(self) -> str:
         return (
-            f"Sheet times are in {self.source}; the course runs in "
-            f"{self.target}.\n"
+            f"Sheet times are in {self.source} (from {self.via}); the course "
+            f"runs in {self.target}.\n"
             f"  Converting {self.cells} time(s) to course time -- the instant "
             f"is preserved, so the wall clock moves.\n"
             f"  e.g. {self.example}"
         )
 
 
-def align_timezone(sheet: Sheet, course_tz: str) -> tuple[Sheet, Realignment | None]:
+def sheet_zone(sheet: Sheet) -> tuple[str | None, str, tuple[str, ...]]:
+    """Which zone the sheet's wall clocks are in, and how that was decided.
+
+    Returns `(iana, via, warnings)`. `iana` is None when the sheet says nothing
+    usable, which the header contract defines as "already course-local".
+
+    **`iana=` wins, but the friendly label is a real fallback, not decoration**
+    (user, 2026-08-22). Canvas is Rails, so `timezone=Eastern Time (US &
+    Canada)` is a `ActiveSupport::TimeZone` name and maps deterministically to
+    an IANA zone. An earlier version ignored it on the grounds that a friendly
+    name "cannot resolve a wall clock across a DST change" -- true of `EST` or
+    `-05:00`, both of which name an *observance* or a fixed offset, but false
+    of the year-round label `pull` actually writes.
+
+    An unreadable label is reported rather than silently ignored: someone who
+    typed a zone into the header meant it to be used, and quietly treating
+    those times as course-local is the failure they would never spot.
+    """
+    if sheet.iana:
+        return sheet.iana, "iana=", ()
+    if not sheet.timezone:
+        return None, "", ()
+
+    resolved = resolve_friendly(sheet.timezone)
+    if resolved:
+        return resolved, f"timezone={sheet.timezone!r}", ()
+    return None, "", (
+        f"{sheet.path} has no `iana=` and its `timezone={sheet.timezone}` is "
+        f"not a timezone this build recognises, so its times are being read as "
+        f"course-local. If they are not, add `iana=<zone>` to row 1 or re-pull.",
+    )
+
+
+def align_timezone(
+    sheet: Sheet, course_tz: str
+) -> tuple[Sheet, Realignment | None, tuple[str, ...]]:
     """Re-express a sheet's times in the course's zone, if they are not already.
 
-    `iana=` says what zone the sheet's wall clocks are written in -- nothing
-    more. It is not a claim about the course, so a disagreement is not an error
-    to refuse; it is a conversion to perform. A sheet edited in Tokyo saying
+    The sheet's zone says what its wall clocks are written in -- nothing more.
+    It is not a claim about the course, so a disagreement is not an error to
+    refuse; it is a conversion to perform. A sheet edited in Tokyo saying
     `12:59` and a course in New York holding `23:59` the previous day describe
     the **same deadline**, and it is the instant a student is held to.
 
@@ -236,11 +279,12 @@ def align_timezone(sheet: Sheet, course_tz: str) -> tuple[Sheet, Realignment | N
     course. Converting once here rather than at each of those three points is
     what keeps them from disagreeing.
 
-    **A missing `iana=` means course time**, per the header contract: the sheet
-    was pulled in course time and the user deleted row 1. Nothing to convert.
+    **A sheet that declares no zone at all means course time**, per the header
+    contract: it was pulled in course time and the user deleted row 1.
     """
-    if not (sheet.iana and course_tz) or sheet.iana == course_tz:
-        return sheet, None
+    source, via, warnings = sheet_zone(sheet)
+    if not (source and course_tz) or source == course_tz:
+        return sheet, None, warnings
 
     unanchored: list[str] = []
     rows: list[AssignmentRow] = []
@@ -267,21 +311,21 @@ def align_timezone(sheet: Sheet, course_tz: str) -> tuple[Sheet, Realignment | N
                 continue
             where = f"{sheet.path.name}, assignment {row.assignment_id}, {date_column}"
             new_date, new_time = convert(
-                date, time, sheet.iana, course_tz, where=where
+                date, time, source, course_tz, where=where
             )
             moved[date_column] = new_date
             moved[time_column] = new_time
             cells += 1
             if not example:
                 example = (
-                    f"{date} {time} {sheet.iana}  ->  "
+                    f"{date} {time} {source}  ->  "
                     f"{new_date} {new_time} {course_tz}"
                 )
         rows.append(replace(row, **moved) if moved else row)
 
     if unanchored:
         raise SheetError(
-            f"{sheet.path} records times in {sheet.iana} but the course runs "
+            f"{sheet.path} records times in {source} but the course runs "
             f"in {course_tz}, so every time has to be converted -- and "
             f"{len(unanchored)} cell(s) have a date with no time to convert: "
             f"{', '.join(unanchored[:5])}"
@@ -301,10 +345,10 @@ def align_timezone(sheet: Sheet, course_tz: str) -> tuple[Sheet, Realignment | N
     if not cells:
         # The zones differ but the sheet holds nothing to convert. Announcing
         # "converting 0 times" with no example to show would be noise.
-        return aligned, None
+        return aligned, None, warnings
     return aligned, Realignment(
-        source=sheet.iana, target=course_tz, cells=cells, example=example,
-    )
+        source=source, target=course_tz, cells=cells, example=example, via=via,
+    ), warnings
 
 
 def describe_scope(sheet: Sheet) -> str:
