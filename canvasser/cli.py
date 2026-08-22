@@ -273,6 +273,41 @@ def cmd_pull(args: argparse.Namespace) -> int:
     return 0
 
 
+def _why_mismatch(previous, got: str, date_column: str, time_column: str,
+                  course_tz: str) -> str:
+    """Say *why* a post-write check failed, not merely that it did.
+
+    "MISMATCH" alone sends the user to Canvas to work out what happened. The
+    two outcomes mean very different things and are worth distinguishing:
+
+    * Canvas still holds exactly what it held before -- the save was rejected
+      or never applied. Something on the page said why; if it was a field
+      message `apply_changes` has already raised with Canvas's own wording, so
+      reaching here means the rejection was silent.
+    * Canvas holds a third value -- it accepted the write and then altered it.
+      Its `:59` end-of-day seconds are the known example, already compared away
+      at minute precision, so anything surviving to here is new behaviour.
+    """
+    if previous is None:
+        return ("no before-value was recorded, so it cannot be said whether "
+                "the save was rejected or the value was altered")
+
+    was = to_minute(
+        " ".join(p for p in (getattr(previous, date_column),
+                             getattr(previous, time_column)) if p)
+    )
+    now = to_minute(got.rsplit(" ", 1)[0] if got else "")
+    if was == now:
+        return (f"Canvas still holds its previous value ({was or '(empty)'}), "
+                f"so the save did not take. Canvas usually explains this on the "
+                f"page -- check the assignment's edit form for a message under "
+                f"the date, most often a date-ordering or term-bounds rule")
+    return (f"Canvas accepted a write but stored something else again "
+            f"(was {was or '(empty)'}, now {now or '(empty)'}). That is not a "
+            f"rule this build knows about; capture the edit page before "
+            f"re-running")
+
+
 def cmd_push(args: argparse.Namespace) -> int:
     """Compare an edited datesheet against the live course.
 
@@ -365,8 +400,18 @@ def cmd_push(args: argparse.Namespace) -> int:
         )
 
     by_key = sheet.by_key()
+    before = {row.key: row for row in current}
     print(f"\nCommitting to course {course_id}. Times read as {source_tz}.")
-    failures = 0
+
+    #: Every failure, with the reason it failed, collected rather than counted.
+    #: A trailing "3 field(s) did not land" says nothing a person can act on --
+    #: the user asked for this directly: *"It would be good to get an explicit
+    #: note as to why when things fail."*
+    problems: list[tuple[str, str]] = []
+
+    def failed(row_title: str, key: str, why: str) -> None:
+        problems.append((f"{row_title}  #{key}", why))
+
     with open_page(headless=not args.headed,
                    on_missing_browser=browser_installer(args)) as page:
         ensure_logged_in(page, config, approver)
@@ -375,12 +420,18 @@ def cmd_push(args: argparse.Namespace) -> int:
             if not wanted.is_base_row:
                 print(f"  SKIP {row.title}: override rows are not written yet.",
                       file=sys.stderr)
-                failures += 1
+                failed(row.title, row.key[0],
+                       "it is an override row, and writing overrides is not "
+                       "implemented -- saving the form submits every date card, "
+                       "so a wrong move deletes a student's accommodation date")
                 continue
             if row.key[0] in blocked:
                 print(f"  SKIP {row.title}: its dates are out of order and "
                       f"Canvas would refuse the save.", file=sys.stderr)
-                failures += 1
+                failed(row.title, row.key[0], next(
+                    (p.split(": ", 1)[1] for p in out_of_order
+                     if p.startswith(row.key[0] + ":")),
+                    "its dates are out of order"))
                 continue
             changes = {
                 change.field: (
@@ -395,10 +446,10 @@ def cmd_push(args: argparse.Namespace) -> int:
                 after = verify(page, config, course_id, row.key[0])
             except (WriteRefused, WriteFailed) as exc:
                 print(f"  REFUSED {row.title}: {exc}", file=sys.stderr)
-                failures += 1
+                failed(row.title, row.key[0], str(exc))
                 continue
             print(f"  {row.title}  #{row.key[0]}")
-            for field, _, _ in FIELD_PAIRS:
+            for field, date_column, time_column in FIELD_PAIRS:
                 if field in changes:
                     got = format_in_course_time(after.get(field) or "", course_tz)
                     asked = " ".join(p for p in changes[field] if p)
@@ -413,11 +464,20 @@ def cmd_push(args: argparse.Namespace) -> int:
                     ok = to_minute(got.rsplit(" ", 1)[0]) == to_minute(asked)
                     print(f"      {field:<11}{asked:<22} -> Canvas now: {got}"
                           f"   {'OK' if ok else 'MISMATCH'}")
-                    failures += 0 if ok else 1
+                    if not ok:
+                        why = _why_mismatch(before.get(row.key), got,
+                                            date_column, time_column, course_tz)
+                        # Said here, against the line it explains, rather than
+                        # gathered into a footer -- "MISMATCH" on its own sends
+                        # the reader to Canvas to work out what happened.
+                        print(f"      {'':<11}why: {why}", file=sys.stderr)
+                        failed(row.title, row.key[0], f"{field}: {why}")
 
-    if failures:
-        print(f"\n{failures} field(s)/row(s) did not land. Nothing was retried.",
-              file=sys.stderr)
+    if problems:
+        print(f"\n{len(problems)} item(s) did not land, each with a reason "
+              f"above. Nothing was retried:", file=sys.stderr)
+        for where, _ in problems:
+            print(f"      {where}", file=sys.stderr)
         return 2
     print("\nCommitted.")
     return 0
