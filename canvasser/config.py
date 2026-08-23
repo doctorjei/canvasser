@@ -97,7 +97,10 @@ PROFILE_DIR = STATE_DIR / "browser-profile"
 SESSION_STATE_FILE = STATE_DIR / "storage_state.json"
 
 CANVAS_BASE_URL = "https://ufl.instructure.com"
-GATORLINK_SSO_URL = f"{CANVAS_BASE_URL}/login/saml/355"
+#: Held as a PATH so it can follow whatever base URL a Config carries. Joining
+#: it to the module constant below is only the default spelling.
+SSO_PATH = "/login/saml/355"
+GATORLINK_SSO_URL = f"{CANVAS_BASE_URL}{SSO_PATH}"
 IDP_HOST = "login.ufl.edu"
 
 
@@ -113,7 +116,10 @@ class Config:
 
     @property
     def sso_url(self) -> str:
-        return GATORLINK_SSO_URL
+        # Built from THIS config's base_url, never the module constant. Reading
+        # the constant meant an overridden CANVAS_BASE_URL produced a config
+        # that authenticated at one institution and read from another.
+        return f"{self.base_url.rstrip('/')}{SSO_PATH}"
 
 
 def load_config(
