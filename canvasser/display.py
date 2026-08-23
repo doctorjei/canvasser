@@ -22,6 +22,7 @@ import os
 import re
 import sys
 from datetime import datetime, timedelta
+from unicodedata import east_asian_width
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # --- colour -----------------------------------------------------------------
@@ -34,7 +35,9 @@ BOLD_GREEN = "\033[1;92m"
 BOLD_YELLOW = "\033[1;93m"
 BOLD_BLUE = "\033[1;94m"
 GREY = "\033[0;37m"
-NORMAL_WHITE = "\033[37m"
+#: One colour, one spelling. These were two constants for the same 37, which is
+#: also the progress bar's colour -- a third name would have made it three.
+NORMAL_WHITE = GREY
 BRIGHT_BOLD_GREEN = "\033[1;92m"
 BRIGHT_BOLD_RED = "\033[1;91m"
 
@@ -51,25 +54,68 @@ def _paint(text: str, code: str) -> str:
 # --- generic text helpers ---------------------------------------------------
 
 
-def fit(text: str, width: int, centre: bool = False) -> str:
-    """Pad to width, truncating with a single-character ellipsis."""
+def display_width(text: str) -> int:
+    """Columns a string occupies, not characters it contains.
+
+    Every layout here is built to an exact column budget, and `len` is not that
+    measurement: one CJK character or emoji occupies two cells. `✨` is the case
+    that proved it -- a Duo box row measuring 32 by `len` draws 34 columns wide.
+    No Canvas title has yet contained such a character, which is precisely why
+    the mistake would have shipped silently.
+    """
+    return sum(2 if east_asian_width(char) in "WF" else 1 for char in text or "")
+
+
+def _truncate(text: str, width: int) -> str:
+    """Cut to a COLUMN budget, never splitting a wide character in half."""
+    out, used = [], 0
+    for char in text:
+        size = 2 if east_asian_width(char) in "WF" else 1
+        if used + size > width:
+            break
+        out.append(char)
+        used += size
+    return "".join(out)
+
+
+def _pad(text: str, width: int, centre: bool) -> str:
+    room = max(0, width - display_width(text))
+    if not centre:
+        return text + " " * room
+    return " " * (room // 2) + text + " " * (room - room // 2)
+
+
+#: The truncation marker, everywhere. Never `…`: it is tofu on some terminals
+#: (droste's finding, and the user's stated preference 2026-08-23). The course
+#: table used to differ from the rest of the display; it no longer does.
+ELLIPSIS = "..."
+
+
+def shorten(text: str, width: int) -> str:
+    """Truncate to a column budget with the three-dot marker. No padding.
+
+    The one place truncation is decided, so the bar, the tables and the boxes
+    cannot drift apart on where a cut lands or what marks it.
+    """
     text = text or ""
-    if len(text) > width:
-        # rstrip first, or a cut landing on a space leaves "Development …".
-        text = text[: width - 1].rstrip() + "…"
-    return text.center(width) if centre else text.ljust(width)
+    if display_width(text) <= width:
+        return text
+    # rstrip first, or a cut landing on a space leaves "Development ...".
+    return _truncate(text, width - len(ELLIPSIS)).rstrip() + ELLIPSIS
+
+
+def fit(text: str, width: int, centre: bool = False) -> str:
+    """Pad to a column width, truncating with the three-dot marker."""
+    return _pad(shorten(text, width), width, centre)
 
 
 def clip(text: str, width: int) -> str:
-    """Pad to width, truncating with a three-dot marker.
+    """Pad to a column width, truncating with the three-dot marker.
 
-    Distinct from `fit` deliberately: the user's spec for these tables shows
-    `Ally Course Access...`, not the `…` the course table uses.
+    Kept separate from `fit` only because it never centres; the two markers
+    agree now that the course table no longer uses a one-character ellipsis.
     """
-    text = text or ""
-    if len(text) > width:
-        text = text[: width - 3].rstrip() + "..."
-    return text.ljust(width)
+    return _pad(shorten(text, width), width, False)
 
 
 TRUTHY = {"yes", "true", "1", "on"}
