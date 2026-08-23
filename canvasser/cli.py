@@ -263,7 +263,7 @@ def cmd_pull(args: argparse.Namespace) -> int:
         course_settings = fetch_settings(page, config, course.id)
 
         print()
-        print(course_heading(course, course_settings))
+        print(course_heading(course_settings))
         print()
         rows, course_tz = pull_course(page, config, course.id, limit=args.limit)
 
