@@ -33,6 +33,7 @@ from .assignments import format_in_course_time, pull_course, read_specific
 from .courses import Scope, apply_scope, fetch_courses, fetch_one
 from .dateparse import DateFormatError
 from .datesheet import SheetError, read_sheet, write_sheet
+from .progress import course_heading, glyphs_for, session_banner, stat_box
 from .display import (
     print_course_table,
     render_diff,
@@ -65,7 +66,7 @@ from .credentials import (
     _read_from_tty,
     tty_available,
 )
-from .duo import APPROVERS, ApprovalError
+from .duo import APPROVERS, ApprovalError, was_announced
 
 
 def config_from_args(args: argparse.Namespace) -> "Config":
@@ -236,9 +237,23 @@ def cmd_pull(args: argparse.Namespace) -> int:
     config = config_from_args(args)
     approver = APPROVERS[args.factor]()
 
+    print()
+    print(session_banner())
+    print()
+    print(f"  Fetching assignment details from "
+          f"{args.course or 'the selected course'}...")
+
     with open_page(headless=not args.headed,
                    on_missing_browser=browser_installer(args)) as page:
+        print("  Connecting...", end="", flush=True)
         ensure_logged_in(page, config, approver)
+        # Duo's box, if it appeared, was written to stderr straight through the
+        # middle of the line above. Continuing that line would append to
+        # whatever the box left on screen, so start a fresh one instead.
+        if was_announced():
+            print("  Connected & authenticated.")
+        else:
+            print(" connected & authenticated.")
 
         course = _resolve_course(page, config, args)
         # One extra page load, for the timezone's human name. Canvas hands out
@@ -246,6 +261,10 @@ def cmd_pull(args: argparse.Namespace) -> int:
         # the settings page, and the sheet carries both -- the label for the
         # person editing it, the id for push to resolve times through.
         course_settings = fetch_settings(page, config, course.id)
+
+        print()
+        print(course_heading(course, course_settings))
+        print()
         rows, course_tz = pull_course(page, config, course.id, limit=args.limit)
 
     out_path = Path(args.out or f"dates-{course.id}.csv")
@@ -257,22 +276,18 @@ def cmd_pull(args: argparse.Namespace) -> int:
         iana=course_tz or course_settings.course_timezone,
     )
 
-    dated = sum(1 for r in rows if r.due_date)
-    opens = sum(1 for r in rows if r.open_date)
-    closes = sum(1 for r in rows if r.close_date)
-    assignments = len({r.assignment_id for r in rows})
-    section_rows = sum(1 for r in rows if not r.is_base_row)
-
-    print(
-        f"\nWrote {len(rows)} row(s) to {out_path}"
-        f"\n  timezone: {course_settings.timezone_label or '(unknown)'} "
-        f"({course_tz or '?'}) -- all times are course-local, no per-value offset"
-        f"\n  {assignments} assignment(s), {section_rows} per-section row(s)"
-        f"\n  dates set: {dated} due, {opens} open, {closes} close"
-    )
-    undated = sum(1 for r in rows if not r.has_any_date)
-    if undated:
-        print(f"  {undated} row(s) have no dates at all.")
+    # Every tally feeds the BOX. The sentence says where the data went, the box
+    # says how much -- so neither repeats the other (user, 2026-08-23).
+    print(f"\n  Pulled and stored in {out_path}.")
+    for line in stat_box([
+        ("Assignments", len({r.assignment_id for r in rows})),
+        ("Assigned by Section", sum(1 for r in rows if not r.is_base_row)),
+        ("Open Dates", sum(1 for r in rows if r.open_date)),
+        ("Due Dates", sum(1 for r in rows if r.due_date)),
+        ("Close Dates", sum(1 for r in rows if r.close_date)),
+        ("No Dates", sum(1 for r in rows if not r.has_any_date)),
+    ], glyphs_for()):
+        print(f"  {line}")
     return 0
 
 

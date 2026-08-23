@@ -19,6 +19,7 @@ from typing import Protocol
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout
 
 from .browser import save_debug_snapshot
+from .progress import duo_box, glyphs_for
 
 DUO_HOST_FRAGMENT = "duosecurity.com"
 
@@ -87,12 +88,32 @@ DUO_EXIT_FRAGMENT = "/exit"
 NUMBER_RESCAN_MS = 5_000
 
 
-def announce_number(number: str) -> None:
-    print(
-        f"\n        ==>  TAP {number}  <==\n",
-        file=sys.stderr,
-        flush=True,
-    )
+#: Whether a Duo box has been drawn this run. The caller leaves its
+#: "Connecting..." line open, and Duo's box lands in the middle of it -- on
+#: stderr, so it cannot be detected by watching stdout. This is how the caller
+#: finds out that its line was interrupted and it must start a fresh one.
+_announced = False
+
+
+def was_announced() -> bool:
+    return _announced
+
+
+def announce_number(number: str | None) -> None:
+    """Show Duo's Verified Push number, or the instruction when there is none.
+
+    `None` is not an error: plenty of Duo tenants have Verified Push switched
+    off, and a plain approve tap is then all that is needed. The frame is drawn
+    either way so the screen keeps its shape.
+
+    Goes to **stderr**, as it always has -- this is a prompt to a human, not
+    part of any output being captured.
+    """
+    global _announced
+    _announced = True
+    box = duo_box(number, glyphs_for(sys.stderr))
+    print("\n" + "\n".join(f"             {line}" for line in box) + "\n",
+          file=sys.stderr, flush=True)
 
 
 def _wait_for_duo_to_clear(page: Page, timeout_ms: int, watch_number: bool = False) -> None:
@@ -266,9 +287,10 @@ class PushApprover:
             flush=True,
         )
 
-        number = read_verification_number(page)
-        if number:
-            announce_number(number)
+        # Unconditional: a tenant with Verified Push switched off returns None,
+        # and that person still needs telling to go and tap Approve. Guarding
+        # this on a number meant they got a silent screen.
+        announce_number(read_verification_number(page))
 
         # watch_number: keep re-reading. The number on screen is not a constant.
         _wait_for_duo_to_clear(page, timeout_ms, watch_number=True)

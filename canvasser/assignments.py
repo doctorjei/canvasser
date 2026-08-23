@@ -35,6 +35,7 @@ from .auth import quiesce
 from .browser import save_debug_snapshot
 from .config import Config
 from .datesheet import AssignmentRow
+from .progress import Progress
 
 ASSIGNMENT_HREF = re.compile(r"/courses/\d+/(?:assignments|quizzes)/(\d+)")
 
@@ -303,7 +304,6 @@ def pull_course(
     config: Config,
     course_id: str,
     limit: int | None = None,
-    prefix: str = "",
 ) -> tuple[list[AssignmentRow], str]:
     """Walk a course's assignments and produce CSV rows.
 
@@ -317,7 +317,11 @@ def pull_course(
 
     rows: list[AssignmentRow] = []
     course_tz = ""
+    # Advance BEFORE the fetch: each page costs ~2s, and a bar that only moved
+    # afterwards would sit frozen for exactly the interval it exists to cover.
+    bar = Progress(len(assignments))
     for index, assignment in enumerate(assignments, start=1):
+        bar.advance(index, assignment.title)
         env = read_assignment_dates(page, assignment)
         course_tz = env.get("course_tz") or course_tz
         overrides = [o for o in (env.get("overrides") or []) if not o.get("unassign")]
@@ -363,22 +367,7 @@ def pull_course(
         )
         rows.append(base)
 
-        summary = base.due or "(no base due date)"
-        if base.open_date or base.close_date:
-            window = "/".join(p or "-" for p in (base.open_date, base.close_date))
-            summary += f"  [{window}]"
-        if overrides:
-            summary += f"  +{len(overrides)} section row(s)"
-        # `prefix` exists because this same progress stream appears during
-        # `push`, where an unlabelled line naming an assignment reads as "we
-        # are changing this one". The user hit exactly that: a Check-In row
-        # scrolled past during a push and looked like an unintended edit.
-        print(
-            f"  {prefix}[{index}/{len(assignments)}] "
-            f"{assignment.title[:48]:<48} {summary}",
-            flush=True,
-        )
-
+    bar.finish()
     return rows, course_tz
 
 
@@ -402,7 +391,9 @@ def read_specific(
     rows: list[AssignmentRow] = []
     course_tz = ""
 
+    bar = Progress(len(assignment_ids))
     for index, assignment_id in enumerate(assignment_ids, start=1):
+        bar.advance(index, f"#{assignment_id}")
         target = Assignment(
             id=assignment_id,
             title=f"assignment {assignment_id}",
@@ -432,12 +423,11 @@ def read_specific(
             **_date_fields(env, course_tz),
         )
         rows.append(base)
-        print(
-            f"  read [{index}/{len(assignment_ids)}] {title[:48]:<48} "
-            f"{base.due or '(no base due date)'}",
-            flush=True,
-        )
+        # Relabel now the title is known. `push` is handed ids, not titles, so
+        # the row opens as `#7261693` and settles into its real name.
+        bar.advance(index, title)
 
+    bar.finish()
     return rows, course_tz
 
 
