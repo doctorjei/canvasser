@@ -37,6 +37,11 @@ canvasser install-browser             # fetch Chromium up front (usually automat
 `push` previews by default. Running it repeatedly while editing a sheet cannot touch the
 course; only `--commit` writes.
 
+Reading a course means loading one page per assignment, so `pull` and `push` show a progress
+bar while they work. Piped or redirected, they print a plain numbered list instead — no
+escape sequences, so a captured log stays readable. Set `CANVASSER_ASCII=1` to force plain
+ASCII drawing on a terminal that cannot render box characters.
+
 ## Requirements
 
 - Python 3.10+ (developed and tested on 3.13)
