@@ -526,7 +526,7 @@ def render_info_diff(diff) -> list[str]:
     out = [_paint(fit("Info push preview -- nothing has been written", 79),
                   BOLD_WHITE_U), ""]
 
-    if diff.is_empty and not diff.has_unsupported:
+    if diff.is_empty and not diff.has_unsupported and not diff.has_invalid:
         out.append(_paint("  No changes. ", BOLD_GREEN)
                    + f"{diff.compared} sheet row(s) match Canvas exactly.")
         return out
@@ -547,6 +547,12 @@ def render_info_diff(diff) -> list[str]:
                 out.append(_paint(
                     "        its points re-scales every student's percentage",
                     BRIGHT_BOLD_RED))
+        for message in row.invalid:
+            # A value this build understands the column for but cannot use --
+            # typically the label a person sees ("Points") where Canvas wants
+            # the option value (`points`). Named here so the dry run says which
+            # cell to fix, rather than costing a page load each to discover.
+            out.append(_paint(f"      {message}", BRIGHT_BOLD_RED))
         for change in row.unsupported:
             # Reported, never attempted. A column pull writes but push cannot
             # act on is a trap: the edit looks applied because nothing
@@ -576,11 +582,14 @@ def render_info_diff(diff) -> list[str]:
         out.append("")
 
     unsupported = sum(len(r.unsupported) for r in diff.changed)
+    invalid = sum(len(r.invalid) for r in diff.changed)
     graded = sum(1 for r in diff.changed if r.graded and r.changes)
     out.append(
         f"  {len(diff.changed)} row(s), {diff.field_count} field(s) would change"
         + (_paint(f"; {unsupported} edit(s) NOT writable yet", BRIGHT_BOLD_RED)
            if unsupported else "")
+        + (_paint(f"; {invalid} cell(s) SKIPPED as invalid", BRIGHT_BOLD_RED)
+           if invalid else "")
         + (_paint(f"; {graded} already graded", BRIGHT_BOLD_RED) if graded else "")
     )
     return out

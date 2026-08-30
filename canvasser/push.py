@@ -435,7 +435,27 @@ def align_timezone(
 #: as not-yet-writable rather than silently ignored -- `pull` populates those
 #: columns, so a user will edit one eventually, and a no-op that looks like a
 #: success is the failure mode this project keeps meeting.
-WRITABLE_INFO_FIELDS = ("points_possible",)
+WRITABLE_INFO_FIELDS = ("points_possible", "grading_type")
+
+#: The values Canvas's "Display Grade as" control actually accepts. **These are
+#: the option VALUES, not the words on screen** -- the option reading "Points"
+#: has value `points`, "Complete/Incomplete" has `pass_fail`, and ENV reports
+#: the value. Typing a label into a value field is a silent no-op that looks
+#: exactly like a successful write.
+#:
+#: Duplicated from `writer.FORM_FIELDS` on purpose: this check runs at diff
+#: time, before a page is ever loaded, so a typo is named in the dry run
+#: instead of costing an edit-page load per row to discover. `writer` still
+#: validates against the page's own options, because this list can go stale and
+#: the page cannot.
+GRADING_TYPES = (
+    "points", "percent", "letter_grade", "gpa_scale", "pass_fail", "not_graded",
+)
+
+#: Taking an assignment out of the gradebook. Not refused -- it is a real thing
+#: to want -- but it hides the points and dates and is not an accident anyone
+#: should make quietly.
+NOT_GRADED = "not_graded"
 
 
 @dataclass(frozen=True)
@@ -446,6 +466,11 @@ class InfoRowDiff:
     #: Edits to columns the write path cannot yet apply. Carried separately so
     #: they can be *reported* without being attempted.
     unsupported: list[FieldChange]
+    #: Cells this build understands the column for but cannot use the value of
+    #: -- a `grading_type` of "Points" (the label) rather than `points` (the
+    #: value), say. Named at diff time so the dry run says which cell to fix,
+    #: rather than costing an edit-page load each to find out.
+    invalid: list[str]
     #: True when Canvas says this assignment already has graded submissions.
     #: A points change then re-scales every student's percentage -- 8.34 out of
     #: 8.33 is over 100%. The user chose warn-and-write over refusing
@@ -472,6 +497,10 @@ class InfoDiff:
     @property
     def has_unsupported(self) -> bool:
         return any(row.unsupported for row in self.changed)
+
+    @property
+    def has_invalid(self) -> bool:
+        return any(row.invalid for row in self.changed)
 
     @property
     def field_count(self) -> int:
@@ -533,6 +562,7 @@ def compare_info(
 
         changes: list[FieldChange] = []
         unsupported: list[FieldChange] = []
+        invalid: list[str] = []
         for column in INFO_EDITABLE:
             if not sheet.specifies(column):
                 continue
@@ -550,12 +580,23 @@ def compare_info(
             elif before == after:
                 continue
             change = FieldChange(field=column, before=before, after=after)
+            if column == "grading_type" and after not in GRADING_TYPES:
+                # Refused here rather than typed and rejected on the page. The
+                # likeliest mistake is writing the label a person sees --
+                # "Points", "Complete/Incomplete" -- where Canvas wants the
+                # value, and that is worth naming precisely.
+                invalid.append(
+                    f"grading_type={after!r} is not one of "
+                    f"{', '.join(GRADING_TYPES)} (these are the option values, "
+                    f"not the words shown on the form)"
+                )
+                continue
             if column in WRITABLE_INFO_FIELDS:
                 changes.append(change)
             else:
                 unsupported.append(change)
 
-        if changes or unsupported:
+        if changes or unsupported or invalid:
             changed.append(
                 InfoRowDiff(
                     assignment_id=wanted.key,
@@ -565,6 +606,7 @@ def compare_info(
                     title=have.title or wanted.title or f"assignment {wanted.key}",
                     changes=changes,
                     unsupported=unsupported,
+                    invalid=invalid,
                     graded=wanted.key in graded,
                 )
             )

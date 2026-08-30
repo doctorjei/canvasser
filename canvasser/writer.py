@@ -494,19 +494,59 @@ def apply_changes(
     return written
 
 
-#: The Points box. **A stable, semantic id -- not a generated one**, confirmed
-#: by recon 2026-08-30: `id="assignment_points_possible"`, `name="points_possible"`,
-#: labelled "Points". That is a classic Rails form input, a different thing from
-#: the InstUI date pickers whose `Selectable___1` ids are render-order counters
-#: and differ between two loads of the same page.
+#: The non-date settings fields, as confirmed by live recon (2026-08-30).
 #:
-#: So this one may be addressed directly -- but the label is verified anyway
-#: before typing, because "the id still exists" and "the id still means points"
-#: are different claims, and only the second one makes a write safe.
-_POINTS_INPUT = "#assignment_points_possible"
+#: **These are classic Rails form controls with stable, semantic ids** -- a
+#: different thing from the InstUI date pickers, whose `Selectable___1` ids are
+#: render-order counters and differ between two loads of the same page. So
+#: these may be addressed directly.
+#:
+#: Each entry still records the label and `name` it expects, and both are
+#: verified before anything is typed: **"the id still exists" and "the id still
+#: means what it meant" are different claims**, and only the second makes a
+#: write safe. Canvas reusing an id for a different control is exactly the kind
+#: of change that would otherwise write a number into the wrong box.
+@dataclass(frozen=True)
+class FormField:
+    column: str                       # the infosheet column
+    selector: str
+    label: str                        # what the <label> must read
+    name: str                         # what the name attribute must be
+    kind: str                         # "text" or "select"
+    #: For a select, the exact option VALUES Canvas accepts. Not the visible
+    #: text: the option reading "Points" has value `points`, and ENV reports
+    #: `points`. Typing the label into a value field is a silent no-op.
+    values: tuple[str, ...] = ()
 
-_POINTS_PROBE = """() => {
-    const el = document.querySelector('#assignment_points_possible');
+
+FORM_FIELDS = {
+    "points_possible": FormField(
+        column="points_possible",
+        selector="#assignment_points_possible",
+        label="Points",
+        name="points_possible",
+        kind="text",
+    ),
+    "grading_type": FormField(
+        column="grading_type",
+        selector="#assignment_grading_type",
+        # NOT "Grading Type" -- Canvas labels this control "Display Grade as",
+        # which is what the recon found and what a person sees on the form.
+        label="Display Grade as",
+        name="grading_type",
+        kind="select",
+        values=("points", "percent", "letter_grade", "gpa_scale", "pass_fail",
+                "not_graded"),
+    ),
+}
+
+#: Selecting this takes the assignment out of the gradebook entirely and hides
+#: its points and dates. Reported loudly rather than refused -- it is a real
+#: thing a person may want -- but it is not a change to make by accident.
+NOT_GRADED = "not_graded"
+
+_FIELD_PROBE = """(selector) => {
+    const el = document.querySelector(selector);
     if (!el) return null;
     const label = el.id
         ? document.querySelector(`label[for="${CSS.escape(el.id)}"]`) : null;
@@ -515,7 +555,10 @@ _POINTS_PROBE = """() => {
         value: el.value ?? '',
         label: (label ? label.textContent : '').trim(),
         name: el.getAttribute('name') || '',
+        tag: el.tagName.toLowerCase(),
         visible: !!(el.offsetParent || style.position === 'fixed'),
+        options: el.tagName.toLowerCase() === 'select'
+            ? Array.from(el.options).map(o => o.value) : null,
     };
 }"""
 
@@ -536,21 +579,29 @@ def _same_number(a: str, b: str) -> bool:
         return False
 
 
-def apply_points(
-    page: Page, config: Config, course_id: str, assignment_id: str, points: str
-) -> Written:
-    """Set one assignment's Points and save. **This writes.**
+def apply_settings(
+    page: Page,
+    config: Config,
+    course_id: str,
+    assignment_id: str,
+    changes: dict[str, str],
+) -> list[Written]:
+    """Set an assignment's non-date settings and save. **This writes.**
 
-    Structurally identical to `apply_changes`, and deliberately so: the three
-    gates below are the ones that were each learned by being wrong, and a
-    second write path that skipped any of them would re-learn them the same
-    expensive way.
+    `changes` maps infosheet column -> wanted value. **Every field is set on
+    one form load and committed by one save**, exactly as `apply_changes` does
+    with the three dates. Saving once per field would mean two page loads, two
+    saves, and a window where the assignment holds half the edit.
+
+    Structurally identical to `apply_changes`, deliberately: the gates below
+    were each learned by being wrong on a live course, and a second write path
+    that skipped any of them would re-learn them the same expensive way.
 
     1. the form must be genuinely ready (`FORM_READY`), never a fixed sleep;
-    2. the typed value is read back out of the DOM *before* saving;
+    2. every typed value is read back out of the DOM *before* saving;
     3. Canvas's own field messages are read after saving.
 
-    `verify` then re-reads ENV, which is the fourth and final check.
+    `verify_settings` then re-reads ENV, which is the fourth and final check.
     """
     _open_editor(page, config, course_id, assignment_id)
     wait_for_form(page)
@@ -565,48 +616,78 @@ def apply_points(
     if overrides:
         raise WriteRefused(
             f"assignment {assignment_id} has {overrides} override(s). Saving "
-            f"this form submits every date card, so writing its points could "
+            f"this form submits every date card, so writing its settings could "
             f"delete a student's accommodation date. Refusing."
         )
 
-    found = page.evaluate(_POINTS_PROBE)
-    if not found or not found["visible"]:
-        snapshot = save_debug_snapshot(page, f"no-points-field-{assignment_id}")
-        raise WriteFailed(
-            f"no visible Points input ({_POINTS_INPUT}) on {page.url}. Canvas's "
-            f"assignment form has changed and this must be re-checked before "
-            f"any write. Snapshot: {snapshot}"
-        )
-    # The id existing is not the same claim as the id still meaning points.
-    if found["label"].lower() != "points" or found["name"] != "points_possible":
-        snapshot = save_debug_snapshot(page, f"points-label-{assignment_id}")
-        raise WriteFailed(
-            f"{_POINTS_INPUT} on {page.url} is labelled {found['label']!r} "
-            f"(name={found['name']!r}), not 'Points'. Refusing to type into a "
-            f"field that may no longer be the points box. Snapshot: {snapshot}"
-        )
+    written: list[Written] = []
+    for column, value in changes.items():
+        field = FORM_FIELDS.get(column)
+        if field is None:
+            raise WriteRefused(
+                f"{column!r} is not a writable field in this build. Refusing "
+                f"rather than guessing which control it means."
+            )
 
-    before = found["value"]
-    box = page.locator(_POINTS_INPUT)
-    box.click()
-    box.fill("")
-    box.type(points, delay=25)
-    # **Enter is never pressed on this form.** It submits rather than
-    # committing the field -- proved live 2026-08-22, when a stray Enter saved
-    # two assignments after the code had decided not to save them.
-    box.evaluate("element => element.blur()")
-    page.wait_for_timeout(150)
+        found = page.evaluate(_FIELD_PROBE, field.selector)
+        if not found or not found["visible"]:
+            snapshot = save_debug_snapshot(page, f"no-{column}-{assignment_id}")
+            raise WriteFailed(
+                f"no visible {field.label!r} control ({field.selector}) on "
+                f"{page.url}. Canvas's assignment form has changed and this "
+                f"must be re-checked before any write. Snapshot: {snapshot}"
+            )
+        # The id existing is not the same claim as the id still meaning this.
+        if (found["label"].strip().lower() != field.label.lower()
+                or found["name"] != field.name):
+            snapshot = save_debug_snapshot(page, f"{column}-label-{assignment_id}")
+            raise WriteFailed(
+                f"{field.selector} on {page.url} is labelled "
+                f"{found['label']!r} (name={found['name']!r}), not "
+                f"{field.label!r}. Refusing to write into a control that may "
+                f"no longer be the one meant. Snapshot: {snapshot}"
+            )
 
-    # Gate 2: read it back before saving. A form that re-initialises after the
-    # value was typed saves cleanly and writes the old number.
-    after_typing = page.evaluate(_POINTS_PROBE)
-    if not after_typing or not _same_number(after_typing["value"], points):
-        snapshot = save_debug_snapshot(page, f"points-reverted-{assignment_id}")
-        raise WriteRefused(
-            f"assignment {assignment_id}: typed {points!r} into Points but the "
-            f"form now holds "
-            f"{(after_typing or {}).get('value')!r}. Nothing was saved. "
-            f"Snapshot: {snapshot}"
+        if field.kind == "select":
+            # Validated against the page's OWN options, not only the table
+            # above: Canvas could add or drop one, and `select_option` on a
+            # value that is not there raises deep in Playwright rather than
+            # saying what was wrong.
+            options = found.get("options") or ()
+            if value not in options:
+                raise WriteRefused(
+                    f"assignment {assignment_id}: {field.label!r} has no option "
+                    f"{value!r}. Canvas accepts {', '.join(options)}. Note "
+                    f"these are the option VALUES, not the words on screen."
+                )
+            page.locator(field.selector).select_option(value)
+        else:
+            box = page.locator(field.selector)
+            box.click()
+            box.fill("")
+            box.type(value, delay=25)
+            # **Enter is never pressed on this form.** It submits rather than
+            # committing the field -- proved live 2026-08-22, when a stray
+            # Enter saved two assignments after the code had decided not to.
+            box.evaluate("element => element.blur()")
+        page.wait_for_timeout(150)
+
+        # Gate 2: read it back before saving. A form that re-initialises after
+        # the value was set saves cleanly and writes the OLD one.
+        after_typing = page.evaluate(_FIELD_PROBE, field.selector)
+        landed = (after_typing or {}).get("value")
+        same = (_same_number(landed or "", value) if field.kind == "text"
+                else landed == value)
+        if not same:
+            snapshot = save_debug_snapshot(page, f"{column}-reverted-{assignment_id}")
+            raise WriteRefused(
+                f"assignment {assignment_id}: set {field.label!r} to {value!r} "
+                f"but the form now holds {landed!r}. Nothing was saved. "
+                f"Snapshot: {snapshot}"
+            )
+        written.append(
+            Written(assignment_id=assignment_id, field=column,
+                    wanted=value, typed=value, confirmed="")
         )
 
     save = _save_button(page)
@@ -623,26 +704,21 @@ def apply_points(
     if "/edit" in page.url:
         complaints = page.evaluate(_FIELD_MESSAGES)
         if complaints:
-            snapshot = save_debug_snapshot(page, f"points-rejected-{assignment_id}")
+            snapshot = save_debug_snapshot(page, f"settings-rejected-{assignment_id}")
             raise WriteFailed(
                 f"Canvas refused the save for assignment {assignment_id}: "
                 f"{'; '.join(complaints)}. Nothing was changed. "
                 f"Snapshot: {snapshot}"
             )
 
-    return Written(
-        assignment_id=assignment_id,
-        field="points_possible",
-        wanted=points,
-        typed=points,
-        confirmed="",
-    )
+    return written
 
 
-def verify_points(
-    page: Page, config: Config, course_id: str, assignment_id: str
-) -> str:
-    """Re-read points straight from ENV after a save.
+def verify_settings(
+    page: Page, config: Config, course_id: str, assignment_id: str,
+    columns: tuple[str, ...],
+) -> dict[str, str]:
+    """Re-read settings straight from ENV after a save.
 
     **The Canvas UI is not evidence** -- a stale index render showed an old
     date for minutes after a write whose stored value was correct throughout.
@@ -650,8 +726,12 @@ def verify_points(
     """
     _open_editor(page, config, course_id, assignment_id)
     page.wait_for_function(SUBJECT_READY, timeout=30_000)
-    value = page.evaluate(f"() => {_SUBJECT}.points_possible")
-    return "" if value is None else str(value)
+    subject = page.evaluate(f"() => {_SUBJECT}")
+    out: dict[str, str] = {}
+    for column in columns:
+        value = (subject or {}).get(column)
+        out[column] = "" if value is None else str(value)
+    return out
 
 
 def verify(page: Page, config: Config, course_id: str, assignment_id: str) -> dict:

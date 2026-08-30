@@ -73,9 +73,9 @@ from .writer import (
     WriteFailed,
     WriteRefused,
     apply_changes,
-    apply_points,
+    apply_settings,
     verify,
-    verify_points,
+    verify_settings,
 )
 from .selection import COURSE_VAR, CourseSelectionError, select_course
 from .config import Config, ConfigError, ENV_FILE, load_config
@@ -430,6 +430,14 @@ def cmd_push_info(args: argparse.Namespace, sheet_path: Path) -> int:
         # user chose warn-and-write over refusing, and the objection to that
         # choice was that a warning in a long preview is easy to scroll past --
         # so it is repeated at the moment it stops being hypothetical.
+        bad = [(r, msg) for r in diff.changed for msg in r.invalid]
+        if bad:
+            print(f"\n  {len(bad)} cell(s) hold a value Canvas does not accept "
+                  f"and are SKIPPED:", file=sys.stderr)
+            for row, msg in bad:
+                print(f"      {row.title} #{row.assignment_id}: {msg}",
+                      file=sys.stderr)
+
         grading_rows = [r for r in diff.changed if r.graded and r.changes]
         if grading_rows:
             print(
@@ -446,31 +454,43 @@ def cmd_push_info(args: argparse.Namespace, sheet_path: Path) -> int:
         for row in diff.changed:
             if not row.changes:
                 continue
-            wanted = next(c for c in row.changes if c.field == "points_possible")
+            # Every field for one assignment goes in ONE form load and one
+            # save. Saving per field would mean two page loads and a window
+            # where the assignment holds half the edit.
+            wanted = {c.field: c.after for c in row.changes}
             try:
-                apply_points(page, config, course_id, row.assignment_id, wanted.after)
-                got = verify_points(page, config, course_id, row.assignment_id)
+                apply_settings(page, config, course_id, row.assignment_id, wanted)
+                got = verify_settings(page, config, course_id, row.assignment_id,
+                                      tuple(wanted))
             except (WriteRefused, WriteFailed) as exc:
                 print(f"  REFUSED {row.title}: {exc}", file=sys.stderr)
                 problems.append(f"{row.title} #{row.assignment_id}")
                 continue
-            ok = same_points(got, wanted.after)
             print(f"  {row.title}  #{row.assignment_id}")
-            print(f"      {'points':<11}{wanted.before} -> {wanted.after}"
-                  f"   Canvas now: {got}   {'OK' if ok else 'MISMATCH'}")
-            if not ok:
-                # Distinguish "Canvas kept its old value" (the save was
-                # rejected -- go read the form) from "Canvas holds a third
-                # value" (it accepted then altered), as `_why_mismatch` does
-                # for dates. A bare MISMATCH tells the reader nothing they can
-                # act on.
-                why = ("Canvas still holds its previous value, so the save was "
-                       "rejected -- open the form and read its message"
-                       if same_points(got, wanted.before) else
-                       f"Canvas accepted the save but holds {got!r}, which is "
-                       f"neither the old nor the new value")
-                print(f"      {'':<11}why: {why}", file=sys.stderr)
-                problems.append(f"{row.title} #{row.assignment_id}")
+            for change in row.changes:
+                landed = got.get(change.field, "")
+                ok = (same_points(landed, change.after)
+                      if change.field == "points_possible"
+                      else landed == change.after)
+                print(f"      {change.field:<18}{change.before} -> {change.after}"
+                      f"   Canvas now: {landed}   {'OK' if ok else 'MISMATCH'}")
+                if not ok:
+                    # Distinguish "Canvas kept its old value" (the save was
+                    # rejected -- go read the form) from "Canvas holds a third
+                    # value" (it accepted then altered), as `_why_mismatch`
+                    # does for dates. A bare MISMATCH tells the reader nothing
+                    # they can act on.
+                    kept = (same_points(landed, change.before)
+                            if change.field == "points_possible"
+                            else landed == change.before)
+                    why = ("Canvas still holds its previous value, so the save "
+                           "was rejected -- open the form and read its message"
+                           if kept else
+                           f"Canvas accepted the save but holds {landed!r}, "
+                           f"which is neither the old nor the new value")
+                    print(f"      {'':<18}why: {why}", file=sys.stderr)
+                    problems.append(
+                        f"{row.title} #{row.assignment_id} ({change.field})")
 
     if problems:
         print(f"\n{len(problems)} item(s) did not land, each with a reason above:",
