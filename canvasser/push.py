@@ -1,20 +1,27 @@
-"""Comparing an edited datesheet against what Canvas currently holds.
+"""Comparing an edited sheet against what Canvas currently holds.
 
-This module is the *diff*. It answers "what would change?" and nothing more --
-no navigation to an edit form, no writes. That separation is deliberate: the
-diff is the thing that gets run over and over while a sheet is being edited,
-and it must never be able to touch the course.
+This module is the *diff*, for **both sheets**: `compare` for the datesheet and
+`compare_info` for the infosheet. It answers "what would change?" and nothing
+more -- no navigation to an edit form, no writes. That separation is
+deliberate: the diff is the thing that gets run over and over while a sheet is
+being edited, and it must never be able to touch the course.
+
+**The two diffs share a shape and almost no rules.** Row identity is a pair
+here and a single id there; there is no timezone to align on the infosheet; and
+an empty cell means "clear it" for a date but "leave it alone" for a setting.
+The infosheet half lives at the bottom of this file, under its own banner.
+Everything down to that banner is dates.
 
 The first test this exists to serve is the **no-op round trip**: pull a course,
 push it back unedited, and see zero changes. Anything that survives that is a
 formatting bug in the sheet, not an edit -- exactly the class of error that
 would otherwise be discovered by writing wrong dates into a live class.
 
-## What counts as a change
+## What counts as a change (datesheet)
 
-Only the six editable columns. `title` and `assign_to` are carried for human
-orientation and are deliberately ignored here: renaming a row in a spreadsheet
-must never retarget or trigger a write.
+Only the six editable date columns. `title` and `assign_to` are carried for
+human orientation and are deliberately ignored here: renaming a row in a
+spreadsheet must never retarget or trigger a write.
 
 Comparison is on the **rendered strings**, not parsed instants, because that is
 what the round trip has to be stable in. `23:59` and `23:59:00` mean the same

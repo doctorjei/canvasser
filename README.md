@@ -15,20 +15,28 @@ automation is the better-supported path for this institution.
 > values are read back out of the form before saving, Canvas's own error messages are read
 > after, and the stored value is re-read from the page's state afterwards.
 >
+> **Assignment settings** — points, grading type, submission types, allowed attempts,
+> publish state — are pulled to a second CSV. Writing them is newer than the date path:
+> `points_possible` and `grading_type` can be written, the rest are reported as not yet
+> writable rather than silently ignored.
+>
 > **Not supported:** assignments with per-student or per-section overrides. Saving Canvas's
 > edit form submits *every* date card, so getting that wrong deletes an accommodation date.
-> It is refused rather than attempted.
+> It is refused rather than attempted — for settings writes too, since they save the same
+> form.
 
 ## What it does
 
-A round trip: **pull dates to a CSV, edit them in a spreadsheet, push them back.**
+A round trip: **pull to CSV, edit in a spreadsheet, push it back.**
 
 ```bash
 canvasser status                      # is the stored session still authenticated?
 canvasser login                       # authenticate (GatorLink + Duo)
 canvasser courses                     # list courses, with ids
 canvasser settings 580777             # course details, sections, navigation
-canvasser pull 580777                 # assignment dates -> CSV
+canvasser pull 580777                 # dates AND settings -> two CSVs
+canvasser pull 580777 --dates         # just dates-580777.csv
+canvasser pull 580777 --info          # just info-580777.csv
 canvasser push dates-580777.csv       # show what would change; writes nothing
 canvasser push dates-580777.csv --commit   # actually write it
 canvasser install-browser             # fetch Chromium up front (usually automatic)
@@ -36,6 +44,14 @@ canvasser install-browser             # fetch Chromium up front (usually automat
 
 `push` previews by default. Running it repeatedly while editing a sheet cannot touch the
 course; only `--commit` writes.
+
+**`push` works out which kind of sheet it was given by reading the file's first row**, not
+its name — so `push info-580777.csv` reaches the settings path even if you rename the file.
+`--dates` and `--info` on `push` are assertions rather than switches: they refuse a file
+that says it is the other kind.
+
+Both sheets come from the same page loads, so asking for one is no faster than asking for
+both.
 
 Reading a course means loading one page per assignment, so `pull` and `push` show a progress
 bar while they work. Piped or redirected, they print a plain numbered list instead — no
@@ -228,6 +244,56 @@ bulk-shift them: `open_*` is Canvas's `unlock_at` ("Available from"), `due_*` is
 
 **Clearing a date works**: leave the cells empty in a column the sheet carries, and `push`
 uses the form's own Clear control.
+
+## The infosheet CSV
+
+Everything about an assignment that is *not* a date:
+
+```
+# canvasser infosheet v1,,course=580777,,,,,,,,
+Assignment Details,,,,Grading,,Submission,,Availability,,
+assignment_id,title,kind,assignment_group,points_possible,grading_type,submission_types,allowed_attempts,published,peer_reviews,override_count
+7289050,01 - Equipment Demonstration,assignment,Intro Assignments,30,points,external_tool,-1,true,false,0
+```
+
+**A separate file from the datesheet, and the reason is one rule, not two.** A date is the
+one field Canvas lets an assignment simply *not have* — so on the datesheet an empty cell
+**clears** the date. Nothing here can be unset: an assignment always has a publish state,
+always sits in exactly one group, and an empty points box is coerced to `0`, which would be
+a silent grade change rather than an absence. So on the infosheet **an empty cell means
+"leave this field alone"**, the same as deleting the column. There is no "clear" marker
+because there is nothing for it to mark.
+
+- Rows are matched on `assignment_id` alone. **There is no `override_id`** — these settings
+  are per assignment, not per date card.
+- **Read-only columns:** `title`, `kind`, `assignment_group`, `override_count`. They are
+  written so the sheet is legible and ignored on the way back in.
+- **`kind` explains the blanks.** A classic quiz's page carries no `grading_type`,
+  `submission_types` or `peer_reviews` at all, so those cells are empty on every quiz row —
+  that is a fact about quizzes, not a failed read.
+- **`override_count` tells you which assignments carry overrides** before you start editing,
+  rather than when `push` refuses the row.
+- Values are written exactly as Canvas reports them, including `allowed_attempts = -1`
+  for unlimited.
+
+### What `push` writes from it
+
+**`points_possible` and `grading_type` today.** Edits to the other columns are reported per
+row as `NOT WRITABLE YET` and skipped — never silently dropped.
+
+`grading_type` takes the option **values**, not the words on the form: `points`, `percent`,
+`letter_grade`, `gpa_scale`, `pass_fail`, `not_graded`. Anything else is refused before a
+page is loaded, naming what is accepted:
+
+```
+Check-In 1   #7289061
+    grading_type='Points' is not one of points, percent, letter_grade, gpa_scale,
+    pass_fail, not_graded (these are the option values, not the words shown on the form)
+```
+
+Changing points on an assignment that **already has graded submissions** re-scales every
+student's percentage, so it is called out against the row and again before writing. It is a
+warning, not a refusal — the write proceeds.
 
 ### When something fails, it says why
 

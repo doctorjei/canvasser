@@ -4,7 +4,8 @@
     canvasser login                # authenticate (prompts Duo if needed)
     canvasser courses --teaching   # list courses with their ids
     canvasser settings <course>    # details, sections, navigation
-    canvasser pull <course>        # assignment dates -> CSV
+    canvasser pull <course>        # dates AND settings -> two CSVs
+    canvasser pull <course> --info # just the settings sheet (--dates for the other)
     canvasser push <sheet.csv>     # what would change; writes nothing
     canvasser push <sheet.csv> --commit    # write it, verifying each field
     canvasser install-browser      # fetch Chromium (otherwise offered on first use)
@@ -903,12 +904,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     push = sub.add_parser(
         "push",
-        help="compare an edited datesheet against the live course",
-        description="Reads a datesheet, re-reads the course, and reports what "
-        "would change. Writes nothing: this is the preview half of the round "
-        "trip, and pull -> push with no edits must report zero changes.",
+        help="compare an edited sheet against the live course",
+        description="Reads a datesheet or an infosheet, re-reads the course, "
+        "and reports what would change. Which kind it is comes from the file's "
+        "own first row, not its name. Writes nothing without --commit: this is "
+        "the preview half of the round trip, and pull -> push with no edits "
+        "must report zero changes.",
     )
-    push.add_argument("sheet", help="path to a datesheet CSV")
+    push.add_argument("sheet", help="path to a datesheet or infosheet CSV")
     push.add_argument(
         "--course", help="cross-check: refuse if the sheet names a different course"
     )

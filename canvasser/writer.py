@@ -1,9 +1,20 @@
-"""Writing dates back into Canvas's assignment edit form.
+"""Writing back into Canvas's assignment edit form.
 
-This is the only module that changes anything. Everything in it is shaped by
-five hazards found on the real form. **Every one of them fails silently** --
-none throws, none navigates anywhere unusual, and four of the five produced a
-run that reported success while the dates were wrong or absent.
+This is the only module that changes anything. Two entry points share one form
+and one discipline: **`apply_changes`** sets the three dates, **`apply_settings`**
+sets the non-date fields (points, grading type). Both open the form once, set
+every value they were given, and save once.
+
+Everything in it is shaped by five hazards found on the real form. **Every one
+of them fails silently** -- none throws, none navigates anywhere unusual, and
+four of the five produced a run that reported success while the dates were
+wrong or absent.
+
+A sixth applies to the settings path specifically: **never infer one control's
+shape from another's.** Points is a classic Rails text input with a stable
+semantic id; the grading control is a `<select>` Canvas labels "Display Grade
+as"; the date pickers are InstUI widgets with ids that rotate between loads.
+See `FORM_FIELDS`.
 
 ## 1. The form speaks the USER's timezone, not the course's
 
