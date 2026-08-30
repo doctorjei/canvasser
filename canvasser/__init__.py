@@ -17,6 +17,6 @@ for details.
 
 #: Single source of truth for the version -- `pyproject.toml` reads it from
 #: here, so a release bumps one line rather than two that can disagree.
-__version__ = "0.1.9"
+__version__ = "0.2.0"
 
 __all__ = ["auth", "browser", "config", "duo", "__version__"]
