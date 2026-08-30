@@ -378,8 +378,10 @@ def cmd_push_info(args: argparse.Namespace, sheet_path: Path) -> int:
     Preview by default, exactly like the datesheet path: everything above the
     commit block is read-only.
 
-    Only `points_possible` can be written today (user, 2026-08-30: one widget at
-    a time). Edits to the other editable columns are **reported per row**, never
+    **`push.WRITABLE_INFO_FIELDS` says what can be written**; it is deliberately
+    a short list, grown one widget at a time (user, 2026-08-30), because each
+    control is a different shape and must be reconnoitred before it is coded.
+    Edits to the remaining editable columns are **reported per row**, never
     silently skipped -- `pull` populates those columns, so someone will edit one,
     and a no-op that looks like a success is the failure this project keeps
     meeting.

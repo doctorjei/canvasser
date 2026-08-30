@@ -437,11 +437,15 @@ def align_timezone(
 # the rule that must not appear here.
 # ---------------------------------------------------------------------------
 
-#: The single field the write path can currently set (user, 2026-08-30: points
-#: first, one widget at a time). Everything else on the infosheet is reported
-#: as not-yet-writable rather than silently ignored -- `pull` populates those
-#: columns, so a user will edit one eventually, and a no-op that looks like a
-#: success is the failure mode this project keeps meeting.
+#: What the write path can set. **Grown one widget at a time on purpose**
+#: (user, 2026-08-30): each control on the form is a different shape and has to
+#: be reconnoitred before it is coded, so adding a column here without looking
+#: at the real page is how a silent no-op gets shipped.
+#:
+#: Everything else on the infosheet is reported as not-yet-writable rather than
+#: silently ignored -- `pull` populates those columns, so a user will edit one
+#: eventually, and a no-op that looks like a success is the failure mode this
+#: project keeps meeting.
 WRITABLE_INFO_FIELDS = ("points_possible", "grading_type")
 
 #: The values Canvas's "Display Grade as" control actually accepts. **These are
