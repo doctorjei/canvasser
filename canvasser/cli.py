@@ -29,14 +29,27 @@ from .browser import (
     install_chromium,
     open_page,
 )
-from .assignments import format_in_course_time, pull_course, read_specific
+from .assignments import (
+    format_in_course_time,
+    pull_course,
+    read_specific,
+    read_specific_info,
+)
 from .courses import Scope, apply_scope, fetch_courses, fetch_one
 from .dateparse import DateFormatError
 from .datesheet import SheetError, read_sheet, write_sheet
+from .infosheet import (
+    DATES as SHEET_DATES,
+    read_sheet as read_info_sheet,
+    INFO as SHEET_INFO,
+    identify as identify_sheet,
+    write_sheet as write_info_sheet,
+)
 from .progress import course_heading, glyphs_for, session_banner, stat_box
 from .display import (
     print_course_table,
     render_diff,
+    render_info_diff,
     render_features,
     render_general,
     render_nav,
@@ -44,10 +57,14 @@ from .display import (
 )
 from .push import (
     FIELD_PAIRS,
+    WRITABLE_INFO_FIELDS,
     align_timezone,
     check_course,
+    check_info_course,
     check_order,
     compare,
+    compare_info,
+    same_points,
     to_minute,
     describe_scope,
 )
@@ -56,7 +73,9 @@ from .writer import (
     WriteFailed,
     WriteRefused,
     apply_changes,
+    apply_points,
     verify,
+    verify_points,
 )
 from .selection import COURSE_VAR, CourseSelectionError, select_course
 from .config import Config, ConfigError, ENV_FILE, load_config
@@ -233,7 +252,23 @@ def cmd_settings(args: argparse.Namespace) -> int:
 
 
 def cmd_pull(args: argparse.Namespace) -> int:
-    """Pull assignment due dates for one course into a CSV."""
+    """Pull one course's assignment dates and settings into CSVs."""
+    # Naming neither selector means both, matching `settings`, where no display
+    # flag shows all five.
+    want_dates = args.dates or not args.info
+    want_info = args.info or not args.dates
+    # `--out` names ONE file; two artifacts cannot share it. Refused rather
+    # than resolved, because both ways of resolving it are worse than an error:
+    # inventing a second name puts data somewhere the user did not ask for, and
+    # dropping an artifact silently loses a pull they paid ~80s of page loads
+    # for.
+    if args.out and want_dates and want_info:
+        raise ConfigError(
+            "--out names a single file, but this pull writes two sheets. "
+            "Add --dates or --info to choose one, or drop --out and take the "
+            "default names (dates-<course>.csv and info-<course>.csv)."
+        )
+
     config = config_from_args(args)
     approver = APPROVERS[args.factor]()
 
@@ -265,20 +300,30 @@ def cmd_pull(args: argparse.Namespace) -> int:
         print()
         print(course_heading(course_settings))
         print()
-        rows, course_tz = pull_course(page, config, course.id, limit=args.limit)
+        pulled = pull_course(page, config, course.id, limit=args.limit)
+    rows, course_tz = pulled.rows, pulled.course_tz
 
-    out_path = Path(args.out or f"dates-{course.id}.csv")
-    write_sheet(
-        rows,
-        out_path,
-        course_id=course.id,
-        timezone=course_settings.timezone_label,
-        iana=course_tz or course_settings.course_timezone,
-    )
+    written: list[Path] = []
+    if want_dates:
+        out_path = Path(args.out or f"dates-{course.id}.csv")
+        write_sheet(
+            rows,
+            out_path,
+            course_id=course.id,
+            timezone=course_settings.timezone_label,
+            iana=course_tz or course_settings.course_timezone,
+        )
+        written.append(out_path)
+    if want_info:
+        # `--out` is guarded above to a single selector, so if it is set here
+        # the infosheet is the only artifact and it owns the name.
+        info_path = Path(args.out) if args.out else Path(f"info-{course.id}.csv")
+        write_info_sheet(pulled.info_rows, info_path, course_id=course.id)
+        written.append(info_path)
 
     # Every tally feeds the BOX. The sentence says where the data went, the box
     # says how much -- so neither repeats the other (user, 2026-08-23).
-    print(f"\n  Pulled and stored in {out_path}.")
+    print(f"\n  Pulled and stored in {', '.join(str(p) for p in written)}.")
     for line in stat_box([
         ("Assignments", len({r.assignment_id for r in rows})),
         ("Assigned by Section", sum(1 for r in rows if not r.is_base_row)),
@@ -326,6 +371,117 @@ def _why_mismatch(previous, got: str, date_column: str, time_column: str,
             f"re-running")
 
 
+def cmd_push_info(args: argparse.Namespace, sheet_path: Path) -> int:
+    """Compare an edited infosheet against the live course, and optionally write.
+
+    Preview by default, exactly like the datesheet path: everything above the
+    commit block is read-only.
+
+    Only `points_possible` can be written today (user, 2026-08-30: one widget at
+    a time). Edits to the other editable columns are **reported per row**, never
+    silently skipped -- `pull` populates those columns, so someone will edit one,
+    and a no-op that looks like a success is the failure this project keeps
+    meeting.
+    """
+    sheet = read_info_sheet(sheet_path)
+    print(
+        f"  Sheet: {sheet_path}  (infosheet v{sheet.version or '?'}, "
+        f"course={sheet.course_id or '?'}, {len(sheet.rows)} row(s))\n"
+        f"  Sheet can change: "
+        f"{', '.join(sheet.editable_present) or 'nothing -- no editable column'}\n"
+        f"  This build can write: {', '.join(WRITABLE_INFO_FIELDS)}",
+        file=sys.stderr,
+    )
+
+    config = config_from_args(args)
+    approver = APPROVERS[args.factor]()
+    with open_page(headless=not args.headed,
+                   on_missing_browser=browser_installer(args)) as page:
+        ensure_logged_in(page, config, approver)
+        course_id = args.course or sheet.course_id
+        if not course_id:
+            raise CourseSelectionError(
+                f"{sheet_path} does not record a course and none was given. "
+                f"Re-run `canvasser pull` to regenerate it with a header."
+            )
+        check_info_course(sheet, course_id)
+
+        targets = sorted({row.assignment_id for row in sheet.rows})
+        print(
+            f"\n  Reading {len(targets)} assignment(s) named by the sheet. "
+            f"This is the read pass -- nothing is being changed.\n",
+            file=sys.stderr,
+        )
+        live = read_specific_info(page, config, course_id, targets)
+        diff = compare_info(sheet, live.rows, live.graded)
+
+        print()
+        print("\n".join(render_info_diff(diff)))
+
+        if not args.commit:
+            return 1 if not diff.is_empty else 0
+        if diff.is_empty:
+            print("\nNothing to commit.")
+            return 0
+
+        # Everything above this line is read-only. Everything below writes.
+        #
+        # The graded warning is restated HERE, not only beside its row. The
+        # user chose warn-and-write over refusing, and the objection to that
+        # choice was that a warning in a long preview is easy to scroll past --
+        # so it is repeated at the moment it stops being hypothetical.
+        grading_rows = [r for r in diff.changed if r.graded and r.changes]
+        if grading_rows:
+            print(
+                f"\n  !! {len(grading_rows)} assignment(s) below already have "
+                f"graded submissions. Changing points re-scales every "
+                f"student's percentage on them:",
+                file=sys.stderr,
+            )
+            for row in grading_rows:
+                print(f"       {row.title}  #{row.assignment_id}", file=sys.stderr)
+
+        print()
+        problems: list[str] = []
+        for row in diff.changed:
+            if not row.changes:
+                continue
+            wanted = next(c for c in row.changes if c.field == "points_possible")
+            try:
+                apply_points(page, config, course_id, row.assignment_id, wanted.after)
+                got = verify_points(page, config, course_id, row.assignment_id)
+            except (WriteRefused, WriteFailed) as exc:
+                print(f"  REFUSED {row.title}: {exc}", file=sys.stderr)
+                problems.append(f"{row.title} #{row.assignment_id}")
+                continue
+            ok = same_points(got, wanted.after)
+            print(f"  {row.title}  #{row.assignment_id}")
+            print(f"      {'points':<11}{wanted.before} -> {wanted.after}"
+                  f"   Canvas now: {got}   {'OK' if ok else 'MISMATCH'}")
+            if not ok:
+                # Distinguish "Canvas kept its old value" (the save was
+                # rejected -- go read the form) from "Canvas holds a third
+                # value" (it accepted then altered), as `_why_mismatch` does
+                # for dates. A bare MISMATCH tells the reader nothing they can
+                # act on.
+                why = ("Canvas still holds its previous value, so the save was "
+                       "rejected -- open the form and read its message"
+                       if same_points(got, wanted.before) else
+                       f"Canvas accepted the save but holds {got!r}, which is "
+                       f"neither the old nor the new value")
+                print(f"      {'':<11}why: {why}", file=sys.stderr)
+                problems.append(f"{row.title} #{row.assignment_id}")
+
+    if problems:
+        print(f"\n{len(problems)} item(s) did not land, each with a reason above:",
+              file=sys.stderr)
+        for where in problems:
+            print(f"      {where}", file=sys.stderr)
+        return 2
+    print("\nCommitted.")
+    return 0
+
+
 def cmd_push(args: argparse.Namespace) -> int:
     """Compare an edited datesheet against the live course.
 
@@ -334,6 +490,25 @@ def cmd_push(args: argparse.Namespace) -> int:
     sheet -- cannot touch the course.
     """
     sheet_path = Path(args.sheet)
+    # Two CSVs with near-identical names now sit side by side, so handing this
+    # the wrong one is a matter of time. **An infosheet would otherwise parse
+    # as a datesheet with every date column absent** -- which means "leave every
+    # date alone", so it would report no changes and exit 0, looking exactly
+    # like a clean run against a course that was in sync.
+    kind = identify_sheet(sheet_path)
+    if args.expect and kind and kind != args.expect:
+        # Named, not built by concatenation: `f"{kind}sheet"` against
+        # kind="dates" reads "datessheet".
+        names = {SHEET_DATES: "datesheet", SHEET_INFO: "infosheet"}
+        raise SheetError(
+            f"{sheet_path} says it is a {names[kind]} in its first row, but "
+            f"--{args.expect} was given. The file's own header is trusted over "
+            f"the flag; check which file you meant rather than renaming it."
+        )
+    # Dispatch on what the FILE says it is, never on the flag. The flag only
+    # asserts; the header decides.
+    if kind == SHEET_INFO:
+        return cmd_push_info(args, sheet_path)
     sheet = read_sheet(sheet_path)
     print(
         f"  Sheet: {sheet_path}  (v{sheet.version or '?'}, "
@@ -641,9 +816,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     pull = sub.add_parser(
         "pull",
-        help="pull assignment due dates for a course into CSV",
+        help="pull a course's assignment dates and settings into CSV",
         description="Course may be an id or a name fragment. If omitted, resolves "
-        f"from --course-file, then ${COURSE_VAR}, then an interactive picker.",
+        f"from --course-file, then ${COURSE_VAR}, then an interactive picker. "
+        "Writes dates-<course>.csv and info-<course>.csv; --dates or --info "
+        "narrows that to one. Both come from the same page loads, so asking "
+        "for one is no faster than asking for both.",
     )
     pull.add_argument(
         "course", nargs="?", help="course id or name fragment (see: canvasser courses)"
@@ -652,7 +830,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--course-file", metavar="PATH", help="read the course id/name from a file"
     )
     add_scope_args(pull)
-    pull.add_argument("--out", help="output CSV path (default: dates-<course>.csv)")
+    # Selectors, following `settings` (--general/--sections/...): naming none
+    # means all. Not mutually exclusive -- `--dates --info` is just both, the
+    # same reading the scope flags settled on.
+    pull.add_argument(
+        "--dates", action="store_true",
+        help="write only the datesheet (default: both sheets)",
+    )
+    pull.add_argument(
+        "--info", action="store_true",
+        help="write only the infosheet: points, grading, submission, publish state",
+    )
+    pull.add_argument("--out", help="output CSV path; only with a single selector")
     pull.add_argument(
         "--limit", type=int, help="only the first N assignments (for a quick check)"
     )
@@ -703,6 +892,19 @@ def build_parser() -> argparse.ArgumentParser:
     push.add_argument(
         "--course", help="cross-check: refuse if the sheet names a different course"
     )
+    # An ASSERTION, not a router. The sheet declares its own kind in row 1 and
+    # that declaration wins; this only says "refuse if it is not what I think".
+    # A flag that could override the header would let date rules run against
+    # info rows, which is the one outcome worth engineering against here.
+    push.add_argument(
+        "--dates", dest="expect", action="store_const", const=SHEET_DATES,
+        help="cross-check: refuse unless the file says it is a datesheet",
+    )
+    push.add_argument(
+        "--info", dest="expect", action="store_const", const=SHEET_INFO,
+        help="cross-check: refuse unless the file says it is an infosheet",
+    )
+    push.set_defaults(expect=None)
     push.add_argument(
         "--limit", type=int, help="only the first N assignments (for a quick check)"
     )

@@ -45,6 +45,7 @@ from dataclasses import dataclass, replace
 
 from .dateparse import convert
 from .datesheet import AssignmentRow, Sheet, SheetError
+from .infosheet import EDITABLE_COLUMNS as INFO_EDITABLE, InfoRow, InfoSheet
 from .timezones import resolve_friendly
 
 #: The three date pairs, grouped for reporting. Canvas's field name first,
@@ -416,6 +417,175 @@ def align_timezone(
     return aligned, Realignment(
         source=source, target=course_tz, cells=cells, example=example, via=via,
     ), warnings
+
+
+# ---------------------------------------------------------------------------
+# The infosheet diff.
+#
+# Same shape as the date diff above and deliberately NOT the same code: the two
+# sheets agree on almost nothing that matters. Row identity is
+# `assignment_id` alone rather than a pair, there is no timezone to align, and
+# **an empty cell means "leave alone" rather than "clear"** -- so the one rule
+# the date path most needs (present-but-empty is an instruction) is precisely
+# the rule that must not appear here.
+# ---------------------------------------------------------------------------
+
+#: The single field the write path can currently set (user, 2026-08-30: points
+#: first, one widget at a time). Everything else on the infosheet is reported
+#: as not-yet-writable rather than silently ignored -- `pull` populates those
+#: columns, so a user will edit one eventually, and a no-op that looks like a
+#: success is the failure mode this project keeps meeting.
+WRITABLE_INFO_FIELDS = ("points_possible",)
+
+
+@dataclass(frozen=True)
+class InfoRowDiff:
+    assignment_id: str
+    title: str
+    changes: list[FieldChange]
+    #: Edits to columns the write path cannot yet apply. Carried separately so
+    #: they can be *reported* without being attempted.
+    unsupported: list[FieldChange]
+    #: True when Canvas says this assignment already has graded submissions.
+    #: A points change then re-scales every student's percentage -- 8.34 out of
+    #: 8.33 is over 100%. The user chose warn-and-write over refusing
+    #: (2026-08-30), so this rides along to be said loudly rather than to block.
+    graded: bool = False
+
+
+@dataclass(frozen=True)
+class InfoDiff:
+    changed: list[InfoRowDiff]
+    missing: list[InfoRow]
+    untouched: list[InfoRow]
+    compared: int
+
+    @property
+    def is_empty(self) -> bool:
+        """Whether a push would write anything.
+
+        Rows whose only edits are unsupported do NOT count as writable -- but
+        they are still reported. See `has_unsupported`.
+        """
+        return not any(row.changes for row in self.changed)
+
+    @property
+    def has_unsupported(self) -> bool:
+        return any(row.unsupported for row in self.changed)
+
+    @property
+    def field_count(self) -> int:
+        return sum(len(row.changes) for row in self.changed)
+
+
+def same_points(before: str, after: str) -> bool:
+    """Whether two points cells mean the same number.
+
+    Compared numerically, not as strings: a spreadsheet will happily rewrite
+    `8.34` as `8.340` or `8.3400000000001`, and a string comparison would
+    report an edit the user never made -- then write it, and report it again on
+    the next push, forever. This is the same lesson as `to_minute`, which
+    exists because comparing seconds created a diff that could never be
+    satisfied.
+
+    Falls back to string equality when either side is not a number, so a
+    non-numeric cell is still *reported* rather than silently swallowed.
+    """
+    a, b = (before or "").strip(), (after or "").strip()
+    if a == b:
+        return True
+    try:
+        return float(a) == float(b)
+    except ValueError:
+        return False
+
+
+def compare_info(
+    sheet: InfoSheet,
+    current: list[InfoRow],
+    graded: frozenset[str] = frozenset(),
+) -> InfoDiff:
+    """Diff an edited infosheet against freshly read rows.
+
+    `current` must come from a read of the same course done *now*, for the same
+    reason the date diff insists on it: the write has to be judged against what
+    Canvas holds at the moment of writing.
+
+    `graded` is the set of assignment ids Canvas reports as already having
+    graded submissions. **Passed in rather than carried as a sheet column on
+    purpose:** it is a fact about the course at the moment of writing, not
+    something the user edits, and putting it in the CSV would both invite an
+    edit that means nothing and change a schema the user has already signed
+    off on.
+    """
+    live = {row.key: row for row in current}
+    seen: set[str] = set()
+
+    changed: list[InfoRowDiff] = []
+    missing: list[InfoRow] = []
+
+    for wanted in sheet.rows:
+        seen.add(wanted.key)
+        have = live.get(wanted.key)
+        if have is None:
+            missing.append(wanted)
+            continue
+
+        changes: list[FieldChange] = []
+        unsupported: list[FieldChange] = []
+        for column in INFO_EDITABLE:
+            if not sheet.specifies(column):
+                continue
+            after = (getattr(wanted, column) or "").strip()
+            # **An empty cell means "leave alone" here.** Nothing on this sheet
+            # can be unset -- an assignment always has points, a publish state
+            # and a group -- so a blank is never an instruction. This is the
+            # one place the datesheet's rule must NOT be copied.
+            if not after:
+                continue
+            before = (getattr(have, column) or "").strip()
+            if column == "points_possible":
+                if same_points(before, after):
+                    continue
+            elif before == after:
+                continue
+            change = FieldChange(field=column, before=before, after=after)
+            if column in WRITABLE_INFO_FIELDS:
+                changes.append(change)
+            else:
+                unsupported.append(change)
+
+        if changes or unsupported:
+            changed.append(
+                InfoRowDiff(
+                    assignment_id=wanted.key,
+                    # Canvas's title wins, as in the date diff: the sheet may
+                    # not carry one, and a renamed cell must not relabel what
+                    # is about to change.
+                    title=have.title or wanted.title or f"assignment {wanted.key}",
+                    changes=changes,
+                    unsupported=unsupported,
+                    graded=wanted.key in graded,
+                )
+            )
+
+    untouched = [row for key, row in live.items() if key not in seen]
+    return InfoDiff(
+        changed=changed,
+        missing=missing,
+        untouched=untouched,
+        compared=len(sheet.rows),
+    )
+
+
+def check_info_course(sheet: InfoSheet, course_id: str) -> None:
+    """Refuse an infosheet that names a different course. See `check_course`."""
+    if sheet.course_id and course_id and sheet.course_id != course_id:
+        raise SheetError(
+            f"{sheet.path} was pulled from course {sheet.course_id}, but this "
+            f"push targets {course_id}. Refusing -- writing one course's "
+            f"settings into another is not a recoverable mistake."
+        )
 
 
 def describe_scope(sheet: Sheet) -> str:

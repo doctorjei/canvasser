@@ -494,6 +494,166 @@ def apply_changes(
     return written
 
 
+#: The Points box. **A stable, semantic id -- not a generated one**, confirmed
+#: by recon 2026-08-30: `id="assignment_points_possible"`, `name="points_possible"`,
+#: labelled "Points". That is a classic Rails form input, a different thing from
+#: the InstUI date pickers whose `Selectable___1` ids are render-order counters
+#: and differ between two loads of the same page.
+#:
+#: So this one may be addressed directly -- but the label is verified anyway
+#: before typing, because "the id still exists" and "the id still means points"
+#: are different claims, and only the second one makes a write safe.
+_POINTS_INPUT = "#assignment_points_possible"
+
+_POINTS_PROBE = """() => {
+    const el = document.querySelector('#assignment_points_possible');
+    if (!el) return null;
+    const label = el.id
+        ? document.querySelector(`label[for="${CSS.escape(el.id)}"]`) : null;
+    const style = window.getComputedStyle(el);
+    return {
+        value: el.value ?? '',
+        label: (label ? label.textContent : '').trim(),
+        name: el.getAttribute('name') || '',
+        visible: !!(el.offsetParent || style.position === 'fixed'),
+    };
+}"""
+
+
+def _same_number(a: str, b: str) -> bool:
+    """Numeric equality for a points box, tolerating formatting.
+
+    Canvas may echo `8.34` as `8.340`. Comparing as text would call a correct
+    write a failure -- the mirror of the seconds bug, where comparing too
+    precisely created a diff that could never be satisfied.
+    """
+    a, b = (a or "").strip(), (b or "").strip()
+    if a == b:
+        return True
+    try:
+        return float(a) == float(b)
+    except ValueError:
+        return False
+
+
+def apply_points(
+    page: Page, config: Config, course_id: str, assignment_id: str, points: str
+) -> Written:
+    """Set one assignment's Points and save. **This writes.**
+
+    Structurally identical to `apply_changes`, and deliberately so: the three
+    gates below are the ones that were each learned by being wrong, and a
+    second write path that skipped any of them would re-learn them the same
+    expensive way.
+
+    1. the form must be genuinely ready (`FORM_READY`), never a fixed sleep;
+    2. the typed value is read back out of the DOM *before* saving;
+    3. Canvas's own field messages are read after saving.
+
+    `verify` then re-reads ENV, which is the fourth and final check.
+    """
+    _open_editor(page, config, course_id, assignment_id)
+    wait_for_form(page)
+
+    # **The override refusal carries across, and the reason is not obvious.**
+    # `points_possible` is per-assignment, so the value itself has nothing to
+    # do with any accommodation -- but saving this form submits every "Assign
+    # to" date card, so writing points to an assignment carrying overrides can
+    # still delete a student's accommodation date. Same hazard, reached from a
+    # direction that looks unrelated.
+    overrides = read_overrides(page)
+    if overrides:
+        raise WriteRefused(
+            f"assignment {assignment_id} has {overrides} override(s). Saving "
+            f"this form submits every date card, so writing its points could "
+            f"delete a student's accommodation date. Refusing."
+        )
+
+    found = page.evaluate(_POINTS_PROBE)
+    if not found or not found["visible"]:
+        snapshot = save_debug_snapshot(page, f"no-points-field-{assignment_id}")
+        raise WriteFailed(
+            f"no visible Points input ({_POINTS_INPUT}) on {page.url}. Canvas's "
+            f"assignment form has changed and this must be re-checked before "
+            f"any write. Snapshot: {snapshot}"
+        )
+    # The id existing is not the same claim as the id still meaning points.
+    if found["label"].lower() != "points" or found["name"] != "points_possible":
+        snapshot = save_debug_snapshot(page, f"points-label-{assignment_id}")
+        raise WriteFailed(
+            f"{_POINTS_INPUT} on {page.url} is labelled {found['label']!r} "
+            f"(name={found['name']!r}), not 'Points'. Refusing to type into a "
+            f"field that may no longer be the points box. Snapshot: {snapshot}"
+        )
+
+    before = found["value"]
+    box = page.locator(_POINTS_INPUT)
+    box.click()
+    box.fill("")
+    box.type(points, delay=25)
+    # **Enter is never pressed on this form.** It submits rather than
+    # committing the field -- proved live 2026-08-22, when a stray Enter saved
+    # two assignments after the code had decided not to save them.
+    box.evaluate("element => element.blur()")
+    page.wait_for_timeout(150)
+
+    # Gate 2: read it back before saving. A form that re-initialises after the
+    # value was typed saves cleanly and writes the old number.
+    after_typing = page.evaluate(_POINTS_PROBE)
+    if not after_typing or not _same_number(after_typing["value"], points):
+        snapshot = save_debug_snapshot(page, f"points-reverted-{assignment_id}")
+        raise WriteRefused(
+            f"assignment {assignment_id}: typed {points!r} into Points but the "
+            f"form now holds "
+            f"{(after_typing or {}).get('value')!r}. Nothing was saved. "
+            f"Snapshot: {snapshot}"
+        )
+
+    save = _save_button(page)
+    if save is None:
+        snapshot = save_debug_snapshot(page, f"no-save-button-{assignment_id}")
+        raise WriteFailed(f"no Save button found on {page.url}. Snapshot: {snapshot}")
+    save.click()
+    page.wait_for_load_state("domcontentloaded")
+    page.wait_for_timeout(2_000)
+
+    # Gate 3: Canvas reports a rejected save only on the page. Both signals are
+    # required together -- a successful save navigates away, and InstUI renders
+    # ordinary hints through the same component as errors.
+    if "/edit" in page.url:
+        complaints = page.evaluate(_FIELD_MESSAGES)
+        if complaints:
+            snapshot = save_debug_snapshot(page, f"points-rejected-{assignment_id}")
+            raise WriteFailed(
+                f"Canvas refused the save for assignment {assignment_id}: "
+                f"{'; '.join(complaints)}. Nothing was changed. "
+                f"Snapshot: {snapshot}"
+            )
+
+    return Written(
+        assignment_id=assignment_id,
+        field="points_possible",
+        wanted=points,
+        typed=points,
+        confirmed="",
+    )
+
+
+def verify_points(
+    page: Page, config: Config, course_id: str, assignment_id: str
+) -> str:
+    """Re-read points straight from ENV after a save.
+
+    **The Canvas UI is not evidence** -- a stale index render showed an old
+    date for minutes after a write whose stored value was correct throughout.
+    ENV is what the page itself was built from.
+    """
+    _open_editor(page, config, course_id, assignment_id)
+    page.wait_for_function(SUBJECT_READY, timeout=30_000)
+    value = page.evaluate(f"() => {_SUBJECT}.points_possible")
+    return "" if value is None else str(value)
+
+
 def verify(page: Page, config: Config, course_id: str, assignment_id: str) -> dict:
     """Re-read an assignment's dates straight from ENV after a save.
 

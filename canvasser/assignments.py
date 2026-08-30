@@ -35,6 +35,7 @@ from .auth import quiesce
 from .browser import save_debug_snapshot
 from .config import Config
 from .datesheet import AssignmentRow
+from .infosheet import InfoRow
 from .progress import Progress
 
 ASSIGNMENT_HREF = re.compile(r"/courses/\d+/(?:assignments|quizzes)/(\d+)")
@@ -70,6 +71,41 @@ ENV_PROBE = """() => {
                 // Canvas can carry "unassigned" targets alongside real ones;
                 // they are not dates and must not become editable rows.
                 unassign: !!(o && o.unassign_item),
+            })),
+
+        // --- infosheet fields, read from the SAME page load ---------------
+        // Confirmed present by live recon on 580777, 2026-08-25 (three
+        // assignments, both kinds). `??` throughout, never `||`: a real `0`
+        // points or a `false` publish state must survive, and `||` would
+        // replace both with the fallback -- the "absent state read as an
+        // absent value" bug, running the other way.
+        //
+        // `kind` matters more than it looks. A CLASSIC QUIZ carries no
+        // grading_type, no submission_types and no peer_reviews at all, so
+        // those cells are blank for quizzes -- and a blank that is not
+        // explained reads as a scraping failure.
+        kind: ENV.ASSIGNMENT ? 'assignment' : (ENV.QUIZ ? 'quiz' : ''),
+        points_possible: subject.points_possible ?? null,
+        grading_type: subject.grading_type ?? null,
+        submission_types: subject.submission_types ?? null,
+        allowed_attempts: subject.allowed_attempts ?? null,
+        published: subject.published ?? null,
+        peer_reviews: subject.peer_reviews ?? null,
+        // NOT a sheet column -- a fact about the course right now. Changing
+        // points_possible where grades exist re-scales every student's
+        // percentage (8.34 out of 8.33 is over 100%), so `push` warns on it.
+        graded_submissions_exist: !!subject.graded_submissions_exist,
+        assignment_group_id: subject.assignment_group_id != null
+            ? String(subject.assignment_group_id) : null,
+        // Course-wide, and present ONLY on assignment edit pages -- a quiz
+        // page has no ENV.ASSIGNMENT_GROUPS at all. Returned so the caller can
+        // build the id->name map once from whichever page offers it and then
+        // resolve every row, quizzes included. Without this, quizzes would
+        // report a bare numeric group id or nothing.
+        groups: (Array.isArray(ENV.ASSIGNMENT_GROUPS) ? ENV.ASSIGNMENT_GROUPS : [])
+            .map(g => ({
+                id: g && g.id != null ? String(g.id) : '',
+                name: (g && g.name) || '',
             })),
     };
 }"""
@@ -299,23 +335,96 @@ def _probe_at(page: Page, url: str, assignment_id: str) -> dict:
     return env
 
 
+def _cell(value) -> str:
+    """One ENV value as a sheet cell.
+
+    Booleans become `true`/`false` and lists become a comma-joined string; a
+    real `0` or `False` must render as itself, which is why this tests for
+    `None` explicitly rather than truthiness.
+
+    **Numbers are written exactly as Canvas reports them**, including
+    `allowed_attempts = -1` for "unlimited". Rendering that as the word
+    "unlimited" would read better but invents vocabulary the sheet would then
+    have to parse back; capture stays faithful while this is read-only.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(v) for v in value)
+    return str(value)
+
+
+def _info_row(env: dict, assignment_id: str, title: str, groups: dict[str, str],
+              override_count: int) -> InfoRow:
+    """One assignment's non-date settings, from an ENV probe already in hand.
+
+    The group name is resolved through the caller's map rather than the page,
+    because a quiz page does not carry `ENV.ASSIGNMENT_GROUPS`. When the map
+    has no entry the raw id is written -- it is worse to read but it is true,
+    and a blank would claim the assignment is in no group, which cannot happen.
+    """
+    group_id = env.get("assignment_group_id") or ""
+    return InfoRow(
+        assignment_id=assignment_id,
+        title=title,
+        kind=_cell(env.get("kind")),
+        assignment_group=groups.get(group_id, group_id),
+        points_possible=_cell(env.get("points_possible")),
+        grading_type=_cell(env.get("grading_type")),
+        submission_types=_cell(env.get("submission_types")),
+        allowed_attempts=_cell(env.get("allowed_attempts")),
+        published=_cell(env.get("published")),
+        peer_reviews=_cell(env.get("peer_reviews")),
+        override_count=str(override_count),
+    )
+
+
+@dataclass(frozen=True)
+class PullResult:
+    """Everything one walk of a course produced.
+
+    A dataclass rather than a tuple because this grew from two values to
+    three: a tuple would have changed arity at every call site silently, and
+    **Python does not check that until the line runs** -- which is exactly how
+    0.1.8 shipped a `pull` that crashed after the Duo approval.
+    """
+
+    rows: list[AssignmentRow]
+    info_rows: list[InfoRow]
+    course_tz: str
+
+
 def pull_course(
     page: Page,
     config: Config,
     course_id: str,
     limit: int | None = None,
-) -> tuple[list[AssignmentRow], str]:
-    """Walk a course's assignments and produce CSV rows.
+) -> PullResult:
+    """Walk a course's assignments and produce rows for both sheets.
 
-    Returns the rows *and* the course timezone, because schema v3 records the
-    zone once in the sheet header rather than on every value -- so the caller
-    that writes the file needs it.
+    Returns the date rows, the info rows, *and* the course timezone -- schema
+    v3 records the zone once in the datesheet header rather than on every
+    value, so the caller that writes the file needs it.
+
+    **Both sheets come from one page load per assignment.** The info fields
+    ride on the same ENV probe the dates already required, so producing the
+    second artifact costs no extra traffic. It also means the two sheets can
+    never disagree about the same assignment, which two separate reads would
+    eventually manage.
     """
     assignments = list_assignments(page, config, course_id)
     if limit:
         assignments = assignments[:limit]
 
     rows: list[AssignmentRow] = []
+    #: (assignment_id, title, env, override_count) per assignment; see below.
+    pending: list[tuple[str, str, dict, int]] = []
+    # id -> name, accumulated from whichever pages carry it. Course-wide, so
+    # one contributing page is enough for every row including the quizzes,
+    # whose own pages never carry it.
+    groups: dict[str, str] = {}
     course_tz = ""
     # Advance BEFORE the fetch: each page costs ~2s, and a bar that only moved
     # afterwards would sit frozen for exactly the interval it exists to cover.
@@ -325,6 +434,9 @@ def pull_course(
         env = read_assignment_dates(page, assignment)
         course_tz = env.get("course_tz") or course_tz
         overrides = [o for o in (env.get("overrides") or []) if not o.get("unassign")]
+        for group in env.get("groups") or []:
+            if group.get("id"):
+                groups[group["id"]] = group.get("name") or ""
 
         # Trust ENV.ASSIGNMENT_ID over the id parsed from the link. A quiz-backed
         # assignment is linked as /quizzes/<quiz_id>, and that number is NOT the
@@ -366,9 +478,19 @@ def pull_course(
             **dates(env),
         )
         rows.append(base)
+        # Held, not built. The group map is course-wide but only assignment
+        # pages carry it, and this course leads with two quizzes -- so building
+        # info rows inside the loop would resolve early rows against a map that
+        # was still empty and write bare numeric ids for them. Build after the
+        # walk, when the map is as complete as it is going to get.
+        pending.append((assignment_id, assignment.title, env, len(overrides)))
 
     bar.finish()
-    return rows, course_tz
+    info_rows = [
+        _info_row(env, assignment_id, title, groups, override_count)
+        for assignment_id, title, env, override_count in pending
+    ]
+    return PullResult(rows=rows, info_rows=info_rows, course_tz=course_tz)
 
 
 def read_specific(
@@ -429,6 +551,63 @@ def read_specific(
 
     bar.finish()
     return rows, course_tz
+
+
+@dataclass(frozen=True)
+class InfoReadResult:
+    """Live info rows, plus the one fact that is not sheet data.
+
+    `graded` is the set of assignment ids Canvas reports as already carrying
+    graded submissions. It is separate from the rows because it belongs to the
+    course at this instant, not to the CSV -- see `push.compare_info`.
+    """
+
+    rows: list[InfoRow]
+    graded: frozenset[str]
+
+
+def read_specific_info(
+    page: Page, config: Config, course_id: str, assignment_ids: list[str]
+) -> InfoReadResult:
+    """Read non-date settings for named assignments only, one page load each.
+
+    The same "go straight to what you were given" rule as `read_specific`:
+    reading all 37 assignments to compare two rows costs ~90s to learn nothing.
+
+    **The group map has the same ordering trap as `pull_course`** --
+    `ENV.ASSIGNMENT_GROUPS` appears only on assignment pages, never quiz pages
+    -- so rows are built after the walk rather than during it.
+    """
+    pending: list[tuple[str, str, dict]] = []
+    groups: dict[str, str] = {}
+    graded: set[str] = set()
+
+    bar = Progress(len(assignment_ids), label="assignments")
+    for index, assignment_id in enumerate(assignment_ids, start=1):
+        bar.advance(index, f"#{assignment_id}")
+        target = Assignment(
+            id=assignment_id,
+            title=f"assignment {assignment_id}",
+            url=f"{config.base_url}/courses/{course_id}/assignments/{assignment_id}",
+        )
+        env = read_assignment_dates(page, target)
+        for group in env.get("groups") or []:
+            if group.get("id"):
+                groups[group["id"]] = group.get("name") or ""
+        real_id = env.get("assignment_id") or assignment_id
+        title = env.get("title") or target.title
+        if env.get("graded_submissions_exist"):
+            graded.add(real_id)
+        overrides = [o for o in (env.get("overrides") or []) if not o.get("unassign")]
+        pending.append((real_id, title, env, len(overrides)))
+        bar.advance(index, title)
+
+    bar.finish()
+    rows = [
+        _info_row(env, real_id, title, groups, override_count)
+        for real_id, title, env, override_count in pending
+    ]
+    return InfoReadResult(rows=rows, graded=frozenset(graded))
 
 
 def _date_fields(source: dict, course_tz: str | None) -> dict:

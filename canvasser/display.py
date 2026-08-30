@@ -511,6 +511,81 @@ def render_diff(diff, sheet) -> list[str]:
     return out
 
 
+def render_info_diff(diff) -> list[str]:
+    """What an infosheet push would change.
+
+    Two things get loud treatment, for the same reason publish state does in
+    the course table -- they are the ones with consequences a re-run cannot
+    undo:
+
+    * **a points change on an assignment that already has grades**, which
+      re-scales every student's percentage; and
+    * **an edit to a column this build cannot write**, which would otherwise be
+      a silent no-op the user reads as success.
+    """
+    out = [_paint(fit("Info push preview -- nothing has been written", 79),
+                  BOLD_WHITE_U), ""]
+
+    if diff.is_empty and not diff.has_unsupported:
+        out.append(_paint("  No changes. ", BOLD_GREEN)
+                   + f"{diff.compared} sheet row(s) match Canvas exactly.")
+        return out
+
+    for row in diff.changed:
+        out.append(_paint(f"  {row.title}", BOLD_WHITE)
+                   + _paint(f"   #{row.assignment_id}", GREY))
+        for change in row.changes:
+            out.append(
+                f"      {fit(change.field, 18)}"
+                f"{_paint(fit(change.before or '(unset)', 14), GREY)}"
+                f" -> {_paint(change.after, BOLD_GREEN)}"
+            )
+            if row.graded:
+                out.append(_paint(
+                    "      ^ this assignment already has graded submissions; "
+                    "changing", BRIGHT_BOLD_RED))
+                out.append(_paint(
+                    "        its points re-scales every student's percentage",
+                    BRIGHT_BOLD_RED))
+        for change in row.unsupported:
+            # Reported, never attempted. A column pull writes but push cannot
+            # act on is a trap: the edit looks applied because nothing
+            # complained.
+            out.append(
+                f"      {fit(change.field, 18)}"
+                f"{_paint(fit(change.before or '(unset)', 14), GREY)}"
+                f" -> {_paint(change.after, GREY)}"
+                + _paint("   NOT WRITABLE YET -- ignored", BRIGHT_BOLD_RED)
+            )
+        out.append("")
+
+    if diff.missing:
+        out.append(_paint(f"  {len(diff.missing)} row(s) in the sheet no longer "
+                          f"exist on Canvas:", BRIGHT_BOLD_RED))
+        for row in diff.missing[:10]:
+            out.append(f"      {row.assignment_id:<10} {row.title}")
+        out.append("")
+
+    if diff.untouched:
+        out.append(_paint(f"  {len(diff.untouched)} assignment(s) not in the "
+                          f"sheet -- left alone:", GREY))
+        for row in diff.untouched[:8]:
+            out.append(_paint(f"      {row.assignment_id:<10} {row.title}", GREY))
+        if len(diff.untouched) > 8:
+            out.append(_paint(f"      ... and {len(diff.untouched) - 8} more", GREY))
+        out.append("")
+
+    unsupported = sum(len(r.unsupported) for r in diff.changed)
+    graded = sum(1 for r in diff.changed if r.graded and r.changes)
+    out.append(
+        f"  {len(diff.changed)} row(s), {diff.field_count} field(s) would change"
+        + (_paint(f"; {unsupported} edit(s) NOT writable yet", BRIGHT_BOLD_RED)
+           if unsupported else "")
+        + (_paint(f"; {graded} already graded", BRIGHT_BOLD_RED) if graded else "")
+    )
+    return out
+
+
 def print_course_table(courses: list) -> None:
     header = GAP.join(fit(label, width) for label, width in COLUMNS)
     colour = colors_enabled()
