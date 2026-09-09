@@ -293,7 +293,7 @@ class Progress:
         self.repaint = _can_repaint(self.stream)
         self.glyphs = ASCII if self.ascii else UNICODE
         self._last_paint = 0.0
-        self._pending: list[str] = []
+        self._pending: list[tuple[int, str]] = []
         self._opened = False
         self._closed = False
 
@@ -301,14 +301,26 @@ class Progress:
 
     def _append_only(self, index: int, title: str) -> None:
         cell = f"{index:<{LIST_INDEX}}  {fit(title, LIST_TITLE)}"
-        self._pending.append(cell)
+        # A repeated index is a RELABEL, not a second item. `push` is handed ids
+        # rather than titles, so it opens a row as `#7289047` and calls again
+        # with the real name once the page gives it up. Appending both made a
+        # pair mean "one item twice" -- the index repeated on every line and a
+        # 19-line log ran to 37.
+        if self._pending and self._pending[-1][0] == index:
+            self._pending[-1] = (index, cell)
+            return
+        # Flush on the arrival of a NEW item, not on reaching two. A cell is
+        # only final once the walk has moved past its index; flushing at two
+        # would print the second half of the pair while it was still `#<id>`,
+        # and a relabel arriving after the line is out has nowhere to land.
         if len(self._pending) == 2:
             self._flush_pair()
+        self._pending.append((index, cell))
 
     def _flush_pair(self) -> None:
         if not self._pending:
             return
-        line = (" " * LIST_GAP).join(self._pending)
+        line = (" " * LIST_GAP).join(cell for _, cell in self._pending)
         self.stream.write("  " + line.rstrip() + "\n")
         self.stream.flush()
         self._pending = []
