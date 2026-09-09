@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from datetime import date
 from pathlib import Path
 
 from . import __version__
@@ -252,6 +253,109 @@ def cmd_settings(args: argparse.Namespace) -> int:
     return 0
 
 
+#: Appended before the extension, so a spreadsheet still opens the file by type.
+PARTIAL_SUFFIX = "-partial"
+
+PARTIAL_PROMPT = ("  [S]uffix new, [o]verwrite existing, [r]ename existing, "
+                  "or [a]bort [S/o/r/a]? ")
+
+
+def partial_path(path: Path) -> Path:
+    """`dates-580777.csv` -> `dates-580777-partial.csv`."""
+    return path.with_name(f"{path.stem}{PARTIAL_SUFFIX}{path.suffix}")
+
+
+def rename_target(path: Path, stamp: str, exists=Path.exists) -> Path:
+    """A free name to move an existing sheet aside to.
+
+    Dated rather than `.bak`, because the useful question later is *which pull
+    is this*, and a `.bak` answers it only until the second one. `exists` is a
+    parameter so the collision walk can be checked without touching a disk.
+    """
+    stem = f"{path.stem}-{stamp}"
+    candidate = path.with_name(f"{stem}{path.suffix}")
+    n = 2
+    while exists(candidate):
+        candidate = path.with_name(f"{stem}-{n}{path.suffix}")
+        n += 1
+    return candidate
+
+
+def resolve_partial_paths(
+    paths: list[Path],
+    *,
+    allow_prompt: bool,
+    stamp: str,
+    ask=None,
+    exists=Path.exists,
+    rename=Path.rename,
+    out=print,
+) -> list[Path]:
+    """Decide where a `--limit` pull may write, asking before it destroys data.
+
+    A partial pull aimed at the DEFAULT filename replaces a complete sheet, and
+    CSVs are gitignored -- so there is no recovery path at all. Near-miss on
+    2026-08-25: a 37-row reference sheet survived only because it happened to
+    have been copied seconds earlier.
+
+    Asked BEFORE the walk rather than at write time, where the ~80s of page
+    loads have already been spent and the answer arrives too late to matter.
+
+    **Suffixing applies to every path, not only the ones that exist.** The two
+    sheets come from one walk and are read as a pair; splitting them across
+    `dates-...-partial.csv` and `info-...csv` would make the pair's halves
+    disagree about which pull they came from.
+
+    The collaborators are injected so this is checkable offline -- it decides
+    what happens to the user's files, which is not a thing to leave to a live
+    run to discover.
+    """
+    at_risk = [p for p in paths if exists(p)]
+    if not at_risk:
+        # Nothing to lose, so nothing to ask. A prompt that fires when there is
+        # no risk is training to answer without reading it.
+        return paths
+
+    names = ", ".join(str(p) for p in at_risk)
+    out(f"\n  {names} already exists.")
+    out("  A partial pull would replace it, and CSVs are not in git.")
+
+    if not allow_prompt:
+        # S is the SAFE default, so taking it silently is right where a prompt
+        # cannot be answered. This deliberately differs from the credentials
+        # rule, which refuses -- a password has no safe default and this does.
+        suffixed = [partial_path(p) for p in paths]
+        out(f"  Not a terminal, so writing {', '.join(str(p) for p in suffixed)}"
+            " instead.")
+        out("  (--out names the file explicitly.)\n")
+        return suffixed
+
+    answer = (ask or _read_from_tty)(PARTIAL_PROMPT).strip().lower()
+    # Empty (a bare Enter, or EOF) takes the default rather than re-asking:
+    # the default is the non-destructive one, so falling into it is safe.
+    choice = answer[:1] or "s"
+    while choice not in ("s", "o", "r", "a"):
+        out(f"  '{answer}' is not one of S, o, r, a.")
+        answer = (ask or _read_from_tty)(PARTIAL_PROMPT).strip().lower()
+        choice = answer[:1] or "s"
+
+    if choice == "a":
+        raise ConfigError("Aborted; nothing was read and nothing was written.")
+    if choice == "o":
+        out("")
+        return paths
+    if choice == "r":
+        for path in at_risk:
+            moved = rename_target(path, stamp, exists=exists)
+            rename(path, moved)
+            out(f"  Renamed {path} -> {moved}")
+        out("")
+        return paths
+    suffixed = [partial_path(p) for p in paths]
+    out(f"  Writing {', '.join(str(p) for p in suffixed)}.\n")
+    return suffixed
+
+
 def cmd_pull(args: argparse.Namespace) -> int:
     """Pull one course's assignment dates and settings into CSVs."""
     # Naming neither selector means both, matching `settings`, where no display
@@ -300,13 +404,32 @@ def cmd_pull(args: argparse.Namespace) -> int:
 
         print()
         print(course_heading(course_settings))
+
+        # Decided BEFORE the walk. `--out` is exempt: that path was typed
+        # deliberately, and an explicit instruction wins here for the same
+        # reason an exact course id beats a name that merely contains it.
+        dates_path = Path(args.out or f"dates-{course.id}.csv")
+        info_path = Path(args.out or f"info-{course.id}.csv")
+        if args.limit and not args.out:
+            wanted = ([dates_path] if want_dates else []) + \
+                     ([info_path] if want_info else [])
+            resolved = resolve_partial_paths(
+                wanted,
+                allow_prompt=not args.no_prompt and tty_available(),
+                stamp=date.today().isoformat(),
+            )
+            if want_dates:
+                dates_path = resolved[0]
+            if want_info:
+                info_path = resolved[-1]
+
         print()
         pulled = pull_course(page, config, course.id, limit=args.limit)
     rows, course_tz = pulled.rows, pulled.course_tz
 
     written: list[Path] = []
     if want_dates:
-        out_path = Path(args.out or f"dates-{course.id}.csv")
+        out_path = dates_path
         write_sheet(
             rows,
             out_path,
@@ -318,7 +441,6 @@ def cmd_pull(args: argparse.Namespace) -> int:
     if want_info:
         # `--out` is guarded above to a single selector, so if it is set here
         # the infosheet is the only artifact and it owns the name.
-        info_path = Path(args.out) if args.out else Path(f"info-{course.id}.csv")
         write_info_sheet(pulled.info_rows, info_path, course_id=course.id)
         written.append(info_path)
 
