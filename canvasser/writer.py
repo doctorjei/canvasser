@@ -73,7 +73,8 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 
-from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout
+from playwright.sync_api import (Error as PlaywrightError, Page,
+                                 TimeoutError as PlaywrightTimeout)
 
 from .browser import save_debug_snapshot
 from .config import Config
@@ -480,8 +481,6 @@ def apply_changes(
             f"no Save button found on {page.url}. Snapshot: {snapshot}"
         )
     save.click()
-    page.wait_for_load_state("domcontentloaded")
-    page.wait_for_timeout(2_000)
 
     # **A rejected save looks exactly like a successful one from here.** Canvas
     # answers a validation failure by staying on the form and rendering a
@@ -493,15 +492,14 @@ def apply_changes(
     # The two signals are required together: a successful save leaves the edit
     # page, and a failed one leaves messages behind. Either alone gives false
     # positives -- InstUI renders hints through the same component.
-    if "/edit" in page.url:
-        complaints = page.evaluate(_FIELD_MESSAGES)
-        if complaints:
-            snapshot = save_debug_snapshot(page, f"rejected-{assignment_id}")
-            raise WriteFailed(
-                f"Canvas refused the save for assignment {assignment_id}: "
-                f"{'; '.join(complaints)}. Nothing was changed. "
-                f"Snapshot: {snapshot}"
-            )
+    complaints = _settle_after_save(page)
+    if complaints:
+        snapshot = save_debug_snapshot(page, f"rejected-{assignment_id}")
+        raise WriteFailed(
+            f"Canvas refused the save for assignment {assignment_id}: "
+            f"{'; '.join(complaints)}. Nothing was changed. "
+            f"Snapshot: {snapshot}"
+        )
     return written
 
 
@@ -838,21 +836,18 @@ def apply_settings(
         snapshot = save_debug_snapshot(page, f"no-save-button-{assignment_id}")
         raise WriteFailed(f"no Save button found on {page.url}. Snapshot: {snapshot}")
     save.click()
-    page.wait_for_load_state("domcontentloaded")
-    page.wait_for_timeout(2_000)
 
     # Gate 3: Canvas reports a rejected save only on the page. Both signals are
     # required together -- a successful save navigates away, and InstUI renders
     # ordinary hints through the same component as errors.
-    if "/edit" in page.url:
-        complaints = page.evaluate(_FIELD_MESSAGES)
-        if complaints:
-            snapshot = save_debug_snapshot(page, f"settings-rejected-{assignment_id}")
-            raise WriteFailed(
-                f"Canvas refused the save for assignment {assignment_id}: "
-                f"{'; '.join(complaints)}. Nothing was changed. "
-                f"Snapshot: {snapshot}"
-            )
+    complaints = _settle_after_save(page)
+    if complaints:
+        snapshot = save_debug_snapshot(page, f"settings-rejected-{assignment_id}")
+        raise WriteFailed(
+            f"Canvas refused the save for assignment {assignment_id}: "
+            f"{'; '.join(complaints)}. Nothing was changed. "
+            f"Snapshot: {snapshot}"
+        )
 
     return written
 
@@ -924,6 +919,54 @@ def _open_editor(page: Page, config: Config, course_id: str, assignment_id: str)
         f"Refusing to type into a page whose state cannot be read back. "
         f"Snapshot: {snapshot}"
     )
+
+
+def _settle_after_save(page: Page) -> list[str]:
+    """Wait for the save to resolve, and return Canvas's field messages.
+
+    **A state, never a duration.** The previous version clicked Save, waited a
+    flat 2 seconds, then read `page.url` and evaluated in the page if it still
+    said `/edit`. That raced the navigation: on a slow save the URL still read
+    `/edit` at the 2s mark, the branch was entered, and Canvas navigated away
+    *during* `page.evaluate`, which killed the run with
+
+        Page.evaluate: Execution context was destroyed, most likely because
+        of a navigation
+
+    -- an unhandled exception, so `main()` let it propagate and the push
+    stopped mid-course with some assignments written and some not. That is the
+    "unexplained exit" first seen 2026-08-24 and finally caught on 2026-09-09,
+    on a live push that had written 9 of 27 rows.
+
+    Two outcomes are waited for by name:
+
+    * navigation off `/edit` -- Canvas accepted the save;
+    * a field message appearing -- Canvas rejected it and said why.
+
+    Whichever happens first ends the wait, so a fast save is not slowed and a
+    rejection is not missed. **The evaluate is still guarded**, because no
+    amount of waiting closes the race completely: the navigation can always
+    land in the microsecond after the check. A destroyed context there is not
+    an error -- it is the page leaving, which is the success signal.
+    """
+    try:
+        page.wait_for_function(
+            f"() => !location.pathname.endsWith('/edit') || ({_FIELD_MESSAGES})().length",
+            timeout=30_000,
+        )
+    except PlaywrightTimeout:
+        # Neither happened: Canvas is simply slow, or the save silently did
+        # nothing. Fall through and let the checks below decide -- ENV is
+        # re-read afterwards regardless, so a stall cannot pass as a success.
+        pass
+    if "/edit" not in page.url:
+        return []
+    try:
+        return page.evaluate(_FIELD_MESSAGES)
+    except PlaywrightError as exc:
+        if "Execution context was destroyed" in str(exc) or "navigation" in str(exc):
+            return []
+        raise
 
 
 def _save_button(page: Page):
