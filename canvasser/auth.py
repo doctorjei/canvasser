@@ -19,17 +19,19 @@ from __future__ import annotations
 
 import sys
 
-from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout
+from playwright.sync_api import (Error as PlaywrightError, Page,
+                                 TimeoutError as PlaywrightTimeout)
 
 from .browser import save_debug_snapshot
-from .config import Config, IDP_HOST, canvas_host
+from .config import Config, canvas_host
 from .credentials import PASSWORD_VAR, USERNAME_VAR
 from .duo import Approver, PushApprover, complete_duo, on_duo_page
 
 #: UF's unauthenticated landing site -- a WordPress help site, NOT the IdP.
-#: No longer part of the liveness decision (see the module docstring); kept
-#: because "never point tooling at elearning.ufl.edu" is a standing rule and
-#: the name is what makes that rule findable.
+#: No longer part of any decision here: liveness is an allowlist, and the
+#: credential check is structural. Kept because "never point tooling at
+#: elearning.ufl.edu" is a standing rule and the name is what makes it
+#: findable. Confirmed still true 2026-09-09: UF's own `/login` redirects here.
 ELEARNING_HOST = "elearning.ufl.edu"
 
 USERNAME_FIELD = "input[name='j_username']"
@@ -117,31 +119,85 @@ def _submit_credentials(page: Page, config: Config) -> None:
     page.wait_for_load_state("domcontentloaded")
 
 
-def _check_for_credential_rejection(page: Page) -> None:
+#: True once the submitted credential form is no longer on the page. That is
+#: the STRUCTURAL signal that primary authentication was accepted: Shibboleth
+#: re-renders its own form when it rejects a password, and navigates away when
+#: it does not.
+FORM_GONE = f"() => !document.querySelector({PASSWORD_FIELD!r})"
+
+#: Words an IdP uses when it turns credentials down. **These no longer decide
+#: anything** -- they are used to quote the page back to the user. Deciding by
+#: wording meant only UF's phrasing was ever recognised.
+REJECTION_WORDS = ("incorrect", "invalid", "failed", "try again", "locked",
+                   "unsuccessful", "not recognized", "again")
+
+
+def _idp_complaint(page: Page) -> str:
+    """Whatever the IdP says about the rejection, if it says anything.
+
+    Best-effort and never load-bearing: an IdP that explains itself gets
+    quoted, and one that does not still produces a clear error.
+    """
+    try:
+        lines = page.evaluate(
+            """() => Array.from(document.querySelectorAll(
+                   '.alert, .form-error, [role=alert], .output--error, p, span'))
+                 .map(e => (e.innerText || '').trim())
+                 .filter(t => t && t.length < 200)""")
+    except PlaywrightError:
+        return ""
+    for line in lines or []:
+        low = line.lower()
+        if any(word in low for word in REJECTION_WORDS):
+            return line
+    return ""
+
+
+def _check_for_credential_rejection(
+    page: Page, config: Config, timeout_ms: int = 20_000,
+) -> None:
     """Fail fast and clearly on a bad password, rather than timing out later.
 
-    Worth being decisive here: repeatedly submitting a wrong password is how
-    accounts get locked out, which is a far worse outcome than an early error.
+    Worth being decisive: repeatedly submitting a wrong password is how
+    accounts get locked out, which is far worse than an early error.
+
+    **The signal is structural, not textual** -- the credential form either
+    survives the submission or it does not. That works at any Shibboleth IdP,
+    including one whose wording nobody here has ever read, which the previous
+    version could not: it matched phrases seen on UF's page, so a wrong
+    password anywhere else fell through to a vague "we are not authenticated"
+    twenty seconds later. The page's own words are still *quoted* when it
+    offers any (`_idp_complaint`); they simply no longer decide.
+
+    **Waiting for a state, never a duration.** Checking "is the form still
+    there" after a fixed settle races the IdP's navigation -- the same race
+    that crashed a live push from the write path's post-save wait. So this
+    waits for the form to *go*, and only a timeout means it stayed.
     """
-    # **Still UF-specific, and deliberately so.** This reads the IdP page's own
-    # words, so it can only speak for an IdP whose wording has been seen. A
-    # different institution's IdP is simply not matched here and the login
-    # fails later with its own message -- which is honest. Widening it to "any
-    # host that is not Canvas" would let an unrelated page's use of the word
-    # "invalid" report a credential rejection that never happened, and the
-    # consequence of a false positive here is a user retyping a correct
-    # password.
-    if IDP_HOST not in page.url:
+    if _looks_authenticated(page.url, config):
+        return  # already through; nothing was rejected
+    try:
+        page.wait_for_function(FORM_GONE, timeout=timeout_ms)
         return
-    body = page.inner_text("body").lower()
-    for phrase in ("incorrect", "invalid", "failed", "try again", "locked"):
-        if phrase in body and "password" in body:
-            snapshot = save_debug_snapshot(page, "login-rejected")
-            raise LoginError(
-                f"The identity provider at {IDP_HOST} rejected the credentials. "
-                f"Check {USERNAME_VAR} / {PASSWORD_VAR} in the secrets file. "
-                f"Snapshot: {snapshot}"
-            )
+    except PlaywrightTimeout:
+        pass
+    except PlaywrightError:
+        # The context was destroyed under us, which means the page navigated --
+        # and navigating away IS the success signal. Not an error. Same
+        # reasoning as `writer._settle_after_save`, which guards its evaluate
+        # for exactly this.
+        return
+
+    complaint = _idp_complaint(page)
+    snapshot = save_debug_snapshot(page, "login-rejected")
+    said = f" It says: {complaint!r}." if complaint else ""
+    raise LoginError(
+        f"The sign-in form at {canvas_host(page.url)} was still on screen "
+        f"{timeout_ms // 1000}s after the credentials were submitted, so they "
+        f"were not accepted.{said} Check {USERNAME_VAR} / {PASSWORD_VAR} in "
+        f"the secrets file. Nothing was retried -- repeated attempts lock "
+        f"accounts. Snapshot: {snapshot}"
+    )
 
 
 def log_in(page: Page, config: Config, approver: Approver | None = None) -> None:
@@ -159,7 +215,7 @@ def log_in(page: Page, config: Config, approver: Approver | None = None) -> None
 
     _submit_credentials(page, config)
     _settle(page)
-    _check_for_credential_rejection(page)
+    _check_for_credential_rejection(page, config)
 
     if on_duo_page(page):
         _log(f"Duo challenge presented; using '{approver.name}' approval.")
