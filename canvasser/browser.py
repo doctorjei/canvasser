@@ -223,7 +223,21 @@ def save_debug_snapshot(page: Page, label: str, directory: Path | None = None) -
     # sensitivity grounds.
     directory = directory or state_dir() / "snapshots"
     directory.mkdir(parents=True, exist_ok=True)
+    # `mkdir` takes the umask, which is 022 on a stock machine -- so this comes
+    # out world-readable unless it is set explicitly, and these files render
+    # whole Canvas pages: student names, grades, submissions. The mode is
+    # applied on EVERY call, not just at creation, because a directory made by
+    # an older build (or by a `parents=True` walk) is already wrong and would
+    # never be corrected otherwise.
+    #
+    # Do not rely on the parent for this. `state_dir()` has no guaranteed mode
+    # -- it is 700 here only because this box points $CANVASSER_HOME at a vault
+    # that happens to be 700, while the platform default (`~/.local/state`) is
+    # not. Found 2026-09-09: the live directory was 755.
+    directory.chmod(0o700)
     stem = directory / label
     page.screenshot(path=f"{stem}.png", full_page=True)
     Path(f"{stem}.html").write_text(page.content())
+    for path in (Path(f"{stem}.png"), Path(f"{stem}.html")):
+        path.chmod(0o600)
     return Path(f"{stem}.png")
