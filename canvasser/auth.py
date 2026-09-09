@@ -225,7 +225,13 @@ def log_in(page: Page, config: Config, approver: Approver | None = None) -> None
         _log(f"Duo page captured: {save_debug_snapshot(page, 'duo-live')}")
         complete_duo(page, approver)
     else:
-        _log("No Duo challenge -- device already remembered.")
+        # **Not necessarily a remembered device.** At UF, no Duo page means Duo
+        # remembered this browser; at Temple it means the IdP asked for no
+        # second factor at all (observed on the first live login, 2026-09-09).
+        # Reporting the UF reading everywhere would tell a Temple user their
+        # device is remembered when nothing is remembering anything.
+        _log("No second factor presented (remembered device, or none required "
+             "by this institution).")
 
     _settle(page)
 
