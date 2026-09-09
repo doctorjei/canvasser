@@ -279,13 +279,14 @@ because there is nothing for it to mark.
 
 ### What `push` writes from it
 
-**`points_possible`, `grading_type`, `submission_types` and `allowed_attempts` today.**
-Edits to the other columns are reported per row as `NOT WRITABLE YET` and skipped — never
-silently dropped.
+**`points_possible`, `grading_type`, `submission_types`, `allowed_attempts` and
+`peer_reviews` today.** `published` is the one remaining column, reported per row as
+`NOT WRITABLE YET` and skipped — never silently dropped.
 
 Each is compared by **meaning rather than text**, so a spreadsheet's reformatting is not
 mistaken for an edit: points numerically (`8.34` = `8.340`), submission types as a set
-(order does not matter), attempts as an integer (`3` = `3.0`). Comparing these as strings
+(order does not matter), attempts as an integer (`3` = `3.0`), peer review as a boolean
+(`TRUE` = `true`, which is what a spreadsheet writes back). Comparing these as strings
 would report a change nobody made, write it, and report it again on every push afterwards.
 
 **Renaming is recognised but not yet written.** A changed `title` is reported as needing
@@ -297,6 +298,10 @@ keep the sheet legible should not quietly rename what students see.
 `online_url`, `media_recording`, `student_annotation`) or a whole mode (`none`, `on_paper`).
 `external_tool` is refused: it needs a tool URL this sheet has no column for, so writing it
 would leave an assignment configured for a tool it does not have.
+
+**`peer_reviews`** takes `true` or `false` — and also `yes`/`no` and `1`/`0`, because a
+spreadsheet that recognises `true` as a boolean re-saves it as `TRUE`. Anything else is
+refused before a page is loaded rather than guessed at either way.
 
 **`allowed_attempts`** takes a positive count, or `-1` for unlimited — Canvas's own
 encoding, which is what the sheet carries. Canvas hides the control unless the assignment

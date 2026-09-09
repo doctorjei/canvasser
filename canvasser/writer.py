@@ -79,6 +79,12 @@ from playwright.sync_api import (Error as PlaywrightError, Page,
 from .browser import save_debug_snapshot
 from .config import Config
 from .dateparse import DateFormatError, resolve, zone_of
+# **The same function the diff parses boolean cells with**, not a second one.
+# Two implementations of "what does this cell say" would eventually disagree,
+# and the one on the write path is the one that decides what a real setting is
+# left as -- the lesson `verify_settings` learned by formatting a value its own
+# way. `push` does not import `writer`, so this direction carries no cycle.
+from .push import parse_flag
 
 #: Labels Canvas gives the three date fields. Stable and meaningful, unlike the
 #: React ids beside them (`Selectable___1`, `Select___2`) which are render-order
@@ -521,7 +527,7 @@ class FormField:
     selector: str
     label: str                        # what the <label> must read
     name: str                         # what the name attribute must be
-    kind: str                         # "text" or "select"
+    kind: str                         # "text", "select" or "checkbox"
     #: For a select, the exact option VALUES Canvas accepts. Not the visible
     #: text: the option reading "Points" has value `points`, and ENV reports
     #: `points`. Typing the label into a value field is a silent no-op.
@@ -546,6 +552,23 @@ FORM_FIELDS = {
         kind="select",
         values=("points", "percent", "letter_grade", "gpa_scale", "pass_fail",
                 "not_graded"),
+    ),
+    # **The simplest control on this form** (recon 2026-09-09) -- and simple is
+    # a finding, not an assumption: the two fields before it were a Rails text
+    # input and a `<select>` labelled something other than its own name, and
+    # `allowed_attempts` inches away is an InstUI pair with no `name` at all.
+    #
+    # Its Rails hidden companion is named `peer_reviews_hidden`, a DIFFERENT
+    # name from the checkbox -- unlike the submission sub-types, where the box
+    # and its hidden partner share one and the box must be picked out by type.
+    # Two adjacent controls, two conventions; the id is used here because it
+    # identifies the checkbox alone, and the `name` check below confirms it.
+    "peer_reviews": FormField(
+        column="peer_reviews",
+        selector="#assignment_peer_reviews_checkbox",
+        label="Require Peer Reviews",
+        name="peer_reviews",
+        kind="checkbox",
     ),
 }
 
@@ -660,6 +683,12 @@ _FIELD_PROBE = """(selector) => {
     const style = window.getComputedStyle(el);
     return {
         value: el.value ?? '',
+        // **A checkbox's `value` is not its state** -- it reads `on` whether
+        // ticked or not, so reading `value` here would call every write a
+        // success. State comes from `checked`, and only from the checkbox
+        // itself: Rails pairs each box with a hidden input that always says
+        // off, which is why the selector must not be able to match one.
+        checked: el.type === 'checkbox' ? el.checked : null,
         label: (label ? label.textContent : '').trim(),
         name: el.getAttribute('name') || '',
         tag: el.tagName.toLowerCase(),
@@ -684,6 +713,61 @@ def _same_number(a: str, b: str) -> bool:
         return float(a) == float(b)
     except ValueError:
         return False
+
+
+def _write_checkbox(
+    page: Page, assignment_id: str, field: FormField, want: bool, found: dict,
+) -> None:
+    """Tick or untick one checkbox, whatever is drawn on top of it.
+
+    **An InstUI checkbox cannot be clicked** (live 2026-09-09). Its real
+    `<input>` is present, visible and enabled -- and a sibling
+    `checkboxFacade` span inside the wrapping `<label>` is painted over it, so
+    every click lands on the facade instead. Playwright retried for the full
+    30s and raised, and `peer_reviews` was the field that proved it:
+
+        <span class="css-...-checkboxFacade__facade"> ... intercepts pointer events
+
+    **The submission sub-type boxes, on the same form, take a plain
+    `set_checked` and always have.** Those are classic Rails inputs; this one is
+    a React component that only looks like its neighbours in the DOM. So this is
+    the project's standing rule arriving on a control that had already been
+    reconnoitred and called simple: **its attributes were simple and operating
+    it is not.** Reading a control's markup says what it *is*, not how it takes
+    input.
+
+    **The facade is not an obstacle to route around** -- it is the thing a
+    person clicks, and the label is what carries it. So the label is clicked,
+    which fires the event chain React is listening for. `force=True` on the
+    input was the other candidate and is worse: it bypasses the actionability
+    checks that are the only evidence the control is operable, and a value set
+    behind a component's back is one Canvas may never see.
+
+    **Clicking toggles, so the state is read first and clicked only when it
+    differs.** That keeps `set_checked`'s guarantee -- a box already in the
+    wanted state is left alone, never turned off -- while operating the control
+    the way the page intends.
+    """
+    if bool(found.get("checked")) == want:
+        return  # already right; clicking here would turn it off
+    # `label[for=...]` rather than the input: the facade lives inside the label,
+    # and clicking the label is what a person does.
+    label = page.locator(f'label[for="{field.selector.lstrip("#")}"]')
+    target = label if label.count() == 1 else page.locator(field.selector)
+    try:
+        target.click()
+    except PlaywrightError as exc:
+        # A control that cannot be operated is a WriteFailed with a snapshot,
+        # not a traceback out of main(). An unhandled Playwright error here
+        # stops the whole run mid-course, which is the failure this project has
+        # already paid for once -- and `cmd_push_info` catches only the two
+        # write exceptions, by design, so that a genuine bug is not swallowed.
+        snapshot = save_debug_snapshot(page, f"{field.column}-stuck-{assignment_id}")
+        raise WriteFailed(
+            f"assignment {assignment_id}: could not operate the "
+            f"{field.label!r} checkbox -- {exc}. Nothing was saved. "
+            f"Snapshot: {snapshot}"
+        ) from exc
 
 
 def _write_submission_types(page: Page, assignment_id: str, value: str) -> None:
@@ -923,7 +1007,16 @@ def apply_settings(
                 f"no longer be the one meant. Snapshot: {snapshot}"
             )
 
-        if field.kind == "select":
+        if field.kind == "checkbox":
+            want = parse_flag(value)
+            if want is None:
+                raise WriteRefused(
+                    f"assignment {assignment_id}: {field.column}={value!r} does "
+                    f"not name a yes or a no. Refusing rather than guessing "
+                    f"which way to leave a real setting."
+                )
+            _write_checkbox(page, assignment_id, field, want, found)
+        elif field.kind == "select":
             # Validated against the page's OWN options, not only the table
             # above: Canvas could add or drop one, and `select_option` on a
             # value that is not there raises deep in Playwright rather than
@@ -950,9 +1043,16 @@ def apply_settings(
         # Gate 2: read it back before saving. A form that re-initialises after
         # the value was set saves cleanly and writes the OLD one.
         after_typing = page.evaluate(_FIELD_PROBE, field.selector)
-        landed = (after_typing or {}).get("value")
-        same = (_same_number(landed or "", value) if field.kind == "text"
-                else landed == value)
+        if field.kind == "checkbox":
+            # Read from `checked`, not `value`: see `_FIELD_PROBE`. The value
+            # recorded is the sheet's own vocabulary, which is what `pull`
+            # writes and what the post-write check compares against.
+            landed = "true" if (after_typing or {}).get("checked") else "false"
+            same = parse_flag(landed) is parse_flag(value)
+        else:
+            landed = (after_typing or {}).get("value")
+            same = (_same_number(landed or "", value) if field.kind == "text"
+                    else landed == value)
         if not same:
             snapshot = save_debug_snapshot(page, f"{column}-reverted-{assignment_id}")
             raise WriteRefused(
@@ -962,7 +1062,8 @@ def apply_settings(
             )
         written.append(
             Written(assignment_id=assignment_id, field=column,
-                    wanted=value, typed=value, confirmed="")
+                    wanted=value, typed=landed if field.kind == "checkbox" else value,
+                    confirmed="")
         )
 
     save = _save_button(page)

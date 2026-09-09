@@ -449,8 +449,57 @@ def align_timezone(
 #: project keeps meeting.
 WRITABLE_INFO_FIELDS = (
     "title", "points_possible", "grading_type", "submission_types",
-    "allowed_attempts",
+    "allowed_attempts", "peer_reviews",
 )
+
+
+#: What a boolean cell may say. `pull` writes `true`/`false` -- but a
+#: spreadsheet that recognises those as booleans **re-saves them as `TRUE` and
+#: `FALSE`**, so a case-sensitive comparison would report an edit nobody made,
+#: write it, and report it again forever. That is `same_points` and
+#: `same_attempts`'s lesson arriving on a third field.
+#:
+#: `yes`/`no` and `1`/`0` are accepted because they are what a person types into
+#: a column of `true`s. Nothing else is guessed at: `t`, `y` and a bare `x` all
+#: read as an intention this cannot confirm.
+FLAG_TRUE = ("true", "yes", "1")
+FLAG_FALSE = ("false", "no", "0")
+
+
+def parse_flag(cell: str) -> bool | None:
+    """A boolean cell as a bool, or None when it does not name one."""
+    text = (cell or "").strip().lower()
+    if text in FLAG_TRUE:
+        return True
+    if text in FLAG_FALSE:
+        return False
+    return None
+
+
+def same_flag(before: str, after: str) -> bool:
+    """Whether two boolean cells mean the same thing.
+
+    Case- and spelling-insensitive across the accepted forms, for the reason
+    recorded on `FLAG_TRUE`. Falls back to string equality so an unparseable
+    cell is still *reported* rather than swallowed.
+    """
+    a, b = parse_flag(before), parse_flag(after)
+    if a is None or b is None:
+        return (before or "").strip() == (after or "").strip()
+    return a is b
+
+
+def check_peer_reviews(cell: str) -> str | None:
+    """Why this peer-review cell cannot be written, or None if it can.
+
+    Checked before a page is loaded, so a bad cell is named in the dry run
+    rather than costing an edit-page load per row to discover.
+    """
+    if parse_flag(cell) is None:
+        return (f"peer_reviews={cell!r} does not name a yes or a no. Canvas "
+                f"accepts {', '.join(FLAG_TRUE)} or {', '.join(FLAG_FALSE)}; "
+                f"`pull` writes true/false")
+    return None
 
 
 def same_attempts(before: str, after: str) -> bool:
@@ -600,6 +649,21 @@ GRADING_TYPES = (
 NOT_GRADED = "not_graded"
 
 
+def check_grading_type(cell: str) -> str | None:
+    """Why this grading-type cell cannot be written, or None if it can.
+
+    Refused here rather than typed and rejected on the page. The likeliest
+    mistake is writing the label a person sees -- "Points",
+    "Complete/Incomplete" -- where Canvas wants the option value, and that is
+    worth naming precisely: it is a silent no-op otherwise.
+    """
+    if (cell or "").strip() not in GRADING_TYPES:
+        return (f"grading_type={cell!r} is not one of "
+                f"{', '.join(GRADING_TYPES)} (these are the option values, "
+                f"not the words shown on the form)")
+    return None
+
+
 @dataclass(frozen=True)
 class InfoRowDiff:
     assignment_id: str
@@ -681,6 +745,46 @@ def same_points(before: str, after: str) -> bool:
         return False
 
 
+#: Per-column comparison, in ONE place. Each of these columns has text that can
+#: differ while its meaning does not -- `8.340` for `8.34`, a reordered
+#: submission-type list, `3.0` for `3`, `TRUE` for `true` -- and comparing such
+#: a cell as text reports an edit nobody made, writes it, and reports it again
+#: forever.
+#:
+#: **A table rather than a chain of `if`s, because the chain had three copies**
+#: -- the diff, the post-write check, and the check that decides *which* failure
+#: is reported -- and a field added to two of the three is exactly the seam that
+#: made a correct `submission_types` write report MISMATCH on 2026-09-09. One
+#: table means the next column is one entry, not three edits that must agree.
+INFO_COMPARISONS = {
+    "points_possible": same_points,
+    "submission_types": same_submission_types,
+    "allowed_attempts": same_attempts,
+    "peer_reviews": same_flag,
+}
+
+
+def same_value(column: str, before: str, after: str) -> bool:
+    """Whether two cells of `column` mean the same thing.
+
+    Plain text equality for columns with no special rule, which is correct for
+    them: a title or a grading-type value means itself.
+    """
+    rule = INFO_COMPARISONS.get(column)
+    return rule(before, after) if rule else before == after
+
+
+#: Why a cell cannot be written, checked at diff time so the dry run names the
+#: cell to fix instead of costing an edit-page load per row to find out. Same
+#: reasoning as `INFO_COMPARISONS`: one table, so a new column is one entry.
+INFO_CELL_CHECKS = {
+    "submission_types": check_submission_types,
+    "allowed_attempts": check_allowed_attempts,
+    "peer_reviews": check_peer_reviews,
+    "grading_type": check_grading_type,
+}
+
+
 def compare_info(
     sheet: InfoSheet,
     current: list[InfoRow],
@@ -728,40 +832,18 @@ def compare_info(
             if not after:
                 continue
             before = (getattr(have, column) or "").strip()
-            if column == "points_possible":
-                if same_points(before, after):
-                    continue
-            elif column == "submission_types":
-                # Set comparison, not text: see `same_submission_types`.
-                if same_submission_types(before, after):
-                    continue
-            elif column == "allowed_attempts":
-                if same_attempts(before, after):
-                    continue
-            elif before == after:
+            # Compared by the column's own rule -- numerically for points, as a
+            # set for submission types, as an integer for attempts, as a boolean
+            # for peer review. One table, shared with the post-write check.
+            if same_value(column, before, after):
                 continue
             change = FieldChange(field=column, before=before, after=after)
-            if column == "submission_types":
-                reason = check_submission_types(after)
+            check = INFO_CELL_CHECKS.get(column)
+            if check:
+                reason = check(after)
                 if reason:
                     invalid.append(reason)
                     continue
-            if column == "allowed_attempts":
-                reason = check_allowed_attempts(after)
-                if reason:
-                    invalid.append(reason)
-                    continue
-            if column == "grading_type" and after not in GRADING_TYPES:
-                # Refused here rather than typed and rejected on the page. The
-                # likeliest mistake is writing the label a person sees --
-                # "Points", "Complete/Incomplete" -- where Canvas wants the
-                # value, and that is worth naming precisely.
-                invalid.append(
-                    f"grading_type={after!r} is not one of "
-                    f"{', '.join(GRADING_TYPES)} (these are the option values, "
-                    f"not the words shown on the form)"
-                )
-                continue
             if column in RENAME_GATED and not allow_rename:
                 # Writable, but not without being asked. Reported so the run
                 # says what it declined to do and how to ask for it -- silence
