@@ -257,14 +257,29 @@ DISPLAYS = (
 )
 
 
+def chosen_displays(args: argparse.Namespace) -> list[str]:
+    """Which settings displays to print. **Naming none means all of them.**
+
+    The same rule `pull` follows -- naming neither `--dates` nor `--info`
+    writes both -- and the documentation has cited *this* command as that
+    rule's precedent since before `pull` had selectors. It was untrue: the
+    default here was `general` alone from the day it was written, so a design
+    decision elsewhere rested on behaviour that never existed. Corrected at the
+    user's direction 2026-09-09, in favour of what the documentation said.
+
+    Split out of `cmd_settings` so it can be checked without a browser. The
+    whole command cannot run offline, which is why nothing caught this.
+    """
+    chosen = [name for name, _ in DISPLAYS if getattr(args, name, False)]
+    return chosen or [name for name, _ in DISPLAYS]
+
+
 def cmd_settings(args: argparse.Namespace) -> int:
     """Show a course's Details, Sections and Navigation on screen."""
     config = config_from_args(args)
     approver = APPROVERS[args.factor]()
 
-    chosen = [name for name, _ in DISPLAYS if getattr(args, name)]
-    if not chosen:
-        chosen = ["general"]
+    chosen = chosen_displays(args)
 
     with open_page(**browser_args(config, args)) as page:
         ensure_logged_in(page, config, approver)
