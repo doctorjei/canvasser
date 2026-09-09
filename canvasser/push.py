@@ -446,7 +446,81 @@ def align_timezone(
 #: silently ignored -- `pull` populates those columns, so a user will edit one
 #: eventually, and a no-op that looks like a success is the failure mode this
 #: project keeps meeting.
-WRITABLE_INFO_FIELDS = ("points_possible", "grading_type")
+WRITABLE_INFO_FIELDS = ("points_possible", "grading_type", "submission_types")
+
+#: The `Submission Type` select's own values (recon 2026-09-09). As with
+#: `grading_type`, these are the option VALUES and not the visible words --
+#: "No Submission", "Online", "On Paper", "External Tool".
+SUBMISSION_MODES = ("none", "on_paper", "online", "external_tool")
+
+#: The five online sub-types, which is what ENV reports once `online` is chosen.
+#: A cell naming any of these means the mode is `online`; the mode itself is
+#: never written in the sheet, because ENV never reports it that way.
+ONLINE_SUBMISSION_TYPES = (
+    "online_text_entry", "online_url", "online_upload", "media_recording",
+    "student_annotation",
+)
+
+#: Expressible in the sheet and writable. `online` is absent deliberately: ENV
+#: reports the chosen sub-types, never the bare mode, so a cell reading
+#: `online` would describe a state Canvas cannot be left in -- picking Online
+#: with no box ticked is not a thing the form saves.
+WRITABLE_SUBMISSION_TYPES = ("none", "on_paper") + ONLINE_SUBMISSION_TYPES
+
+#: **Refused, and not for lack of a control.** Selecting External Tool requires
+#: a tool URL, and the infosheet has no column carrying one -- so a write would
+#: produce an assignment configured for an external tool with no tool attached.
+#: Refused at diff time, naming the reason, rather than half-configuring a real
+#: assignment (user, 2026-09-09: "that's good for now").
+UNWRITABLE_SUBMISSION_TYPES = ("external_tool",)
+
+
+def same_submission_types(before: str, after: str) -> bool:
+    """Whether two submission-type cells name the same set.
+
+    **Order-insensitive.** Canvas reports its own order and a person types
+    theirs, so `online_upload,online_text_entry` and the reverse are the same
+    assignment. Comparing as text would report an edit nobody made, write it,
+    and report it again forever -- the unsatisfiable-diff trap that `to_minute`
+    and `same_points` each exist to avoid.
+    """
+    return _type_set(before) == _type_set(after)
+
+
+def _type_set(cell: str) -> frozenset[str]:
+    return frozenset(p.strip() for p in (cell or "").split(",") if p.strip())
+
+
+def check_submission_types(cell: str) -> str | None:
+    """Why this cell cannot be written, or None if it can.
+
+    Checked before a page is loaded, so a bad cell is named in the dry run
+    rather than costing an edit-page load per row to discover.
+    """
+    wanted = _type_set(cell)
+    unknown = sorted(wanted - set(SUBMISSION_MODES) - set(ONLINE_SUBMISSION_TYPES))
+    if unknown:
+        return (f"submission_types={cell!r} contains {', '.join(unknown)}, "
+                f"which Canvas does not report. Accepted: "
+                f"{', '.join(WRITABLE_SUBMISSION_TYPES)}")
+    refused = sorted(wanted & set(UNWRITABLE_SUBMISSION_TYPES))
+    if refused:
+        return (f"submission_types={cell!r} selects {', '.join(refused)}, which "
+                f"needs a tool URL the infosheet has no column for. Writing it "
+                f"would leave an external-tool assignment with no tool. Set it "
+                f"in Canvas instead")
+    if "online" in wanted:
+        return (f"submission_types={cell!r} names the bare mode 'online'. "
+                f"Canvas reports the chosen sub-types instead, so name them: "
+                f"{', '.join(ONLINE_SUBMISSION_TYPES)}")
+    # `none` and `on_paper` are whole states, not ingredients. Combining either
+    # with anything describes an assignment Canvas cannot be in, and picking a
+    # winner would be a guess about which half the user meant.
+    exclusive = sorted(wanted & {"none", "on_paper"})
+    if exclusive and len(wanted) > 1:
+        return (f"submission_types={cell!r} combines {exclusive[0]!r} with "
+                f"other types. It is a complete state on its own")
+    return None
 
 #: The values Canvas's "Display Grade as" control actually accepts. **These are
 #: the option VALUES, not the words on screen** -- the option reading "Points"
@@ -588,9 +662,18 @@ def compare_info(
             if column == "points_possible":
                 if same_points(before, after):
                     continue
+            elif column == "submission_types":
+                # Set comparison, not text: see `same_submission_types`.
+                if same_submission_types(before, after):
+                    continue
             elif before == after:
                 continue
             change = FieldChange(field=column, before=before, after=after)
+            if column == "submission_types":
+                reason = check_submission_types(after)
+                if reason:
+                    invalid.append(reason)
+                    continue
             if column == "grading_type" and after not in GRADING_TYPES:
                 # Refused here rather than typed and rejected on the page. The
                 # likeliest mistake is writing the label a person sees --

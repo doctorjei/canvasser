@@ -551,6 +551,59 @@ FORM_FIELDS = {
     ),
 }
 
+#: ENV value -> the checkbox's `name` attribute (recon 2026-09-09).
+#:
+#: **Addressed by name, never by an id built from the value.** Four of these
+#: look regular and the fifth does not: `student_annotation`'s box is
+#: `assignment_annotated_document`, so `assignment_student_annotation` -- the
+#: id anyone would construct -- matches nothing at all. A locator that finds
+#: nothing on the field the user asked to change is precisely the silent no-op
+#: this project keeps meeting.
+#:
+#: Each box is also paired with a Rails hidden input of the same name holding
+#: `0`, so **state is read from the checkbox**; the hidden one always says off.
+ONLINE_TYPE_BOXES = {
+    "online_text_entry": "online_submission_types[online_text_entry]",
+    "online_url": "online_submission_types[online_url]",
+    "online_upload": "online_submission_types[online_upload]",
+    "media_recording": "online_submission_types[media_recording]",
+    "student_annotation": "online_submission_types[student_annotation]",
+}
+
+SUBMISSION_SELECT = "#assignment_submission_type"
+
+#: Reads the whole submission-type state back as ENV would report it: the bare
+#: mode when it is `none`/`on_paper`, otherwise the ticked sub-types. Returned
+#: sorted so a comparison cannot fail on ordering alone.
+_SUBMISSION_PROBE = """(boxes) => {
+    const select = document.querySelector('#assignment_submission_type');
+    if (!select) return null;
+    const label = document.querySelector('label[for="assignment_submission_type"]');
+    const mode = select.value;
+    let types = [];
+    if (mode === 'online') {
+        for (const [value, name] of Object.entries(boxes)) {
+            const box = document.querySelector(
+                `input[type=checkbox][name="${CSS.escape(name)}"]`);
+            if (box && box.checked) types.push(value);
+        }
+    } else {
+        types = [mode];
+    }
+    return {
+        mode: mode,
+        label: (label ? label.textContent : '').trim(),
+        name: select.getAttribute('name') || '',
+        options: Array.from(select.options).map(o => o.value),
+        types: types.sort(),
+        // Canvas hides the sub-type block until Online is chosen, so "did the
+        // boxes appear" is part of readiness, not a detail.
+        boxes_present: Object.values(boxes).filter(n => document.querySelector(
+            `input[type=checkbox][name="${CSS.escape(n)}"]`)).length,
+    };
+}"""
+
+
 #: Selecting this takes the assignment out of the gradebook entirely and hides
 #: its points and dates. Reported loudly rather than refused -- it is a real
 #: thing a person may want -- but it is not a change to make by accident.
@@ -588,6 +641,65 @@ def _same_number(a: str, b: str) -> bool:
         return float(a) == float(b)
     except ValueError:
         return False
+
+
+def _write_submission_types(page: Page, assignment_id: str, value: str) -> None:
+    """Set the Submission Type select and its sub-type checkboxes.
+
+    **One sheet cell, two kinds of control** -- unlike every field written so
+    far. The cell names either a whole mode (`none`, `on_paper`) or the online
+    sub-types, and choosing `online` is what makes the boxes meaningful.
+
+    Ordered deliberately: the select goes first, because the sub-type block is
+    **not in the DOM at all** while the mode is `none` (recon 2026-09-09). So
+    the boxes are waited for as a *state* after the mode changes, never typed
+    at blind or after a fixed sleep -- the mistake `FORM_READY` exists for.
+    """
+    wanted = sorted(p.strip() for p in value.split(",") if p.strip())
+    mode = wanted[0] if wanted and wanted[0] in ("none", "on_paper") else "online"
+
+    found = page.evaluate(_SUBMISSION_PROBE, ONLINE_TYPE_BOXES)
+    if not found:
+        snapshot = save_debug_snapshot(page, f"no-submission-{assignment_id}")
+        raise WriteFailed(
+            f"no Submission Type control ({SUBMISSION_SELECT}) on {page.url}. "
+            f"Canvas's assignment form has changed and this must be re-checked "
+            f"before any write. Snapshot: {snapshot}"
+        )
+    # The id existing and the id still meaning this are different claims.
+    if found["label"].strip().lower() != "submission type" or found["name"] != "submission_type":
+        snapshot = save_debug_snapshot(page, f"submission-label-{assignment_id}")
+        raise WriteFailed(
+            f"{SUBMISSION_SELECT} is labelled {found['label']!r} "
+            f"(name={found['name']!r}), not 'Submission Type'. Refusing to "
+            f"write into a control that may no longer be the one meant. "
+            f"Snapshot: {snapshot}"
+        )
+    if mode not in (found.get("options") or ()):
+        raise WriteRefused(
+            f"assignment {assignment_id}: Submission Type has no option "
+            f"{mode!r}. Canvas accepts {', '.join(found['options'])}. These are "
+            f"the option VALUES, not the words on screen."
+        )
+
+    page.locator(SUBMISSION_SELECT).select_option(mode)
+
+    if mode == "online":
+        # Wait for the block to exist, rather than assuming the select's change
+        # handler has already run. A fixed wait is never a readiness check.
+        page.wait_for_function(
+            """(boxes) => Object.values(boxes).every(n => document.querySelector(
+                   `input[type=checkbox][name="${CSS.escape(n)}"]`))""",
+            arg=ONLINE_TYPE_BOXES,
+            timeout=10_000,
+        )
+        for env_value, box_name in ONLINE_TYPE_BOXES.items():
+            box = page.locator(f'input[type=checkbox][name="{box_name}"]')
+            should = env_value in wanted
+            # `set_checked` rather than `click`: clicking toggles, so a box
+            # already in the wanted state would be turned off by it.
+            if box.is_checked() != should:
+                box.set_checked(should)
 
 
 def apply_settings(
@@ -633,6 +745,26 @@ def apply_settings(
 
     written: list[Written] = []
     for column, value in changes.items():
+        if column == "submission_types":
+            # Its own shape: a select plus five checkboxes, so it does not fit
+            # the one-selector FormField table. Same three gates all the same.
+            _write_submission_types(page, assignment_id, value)
+            page.wait_for_timeout(150)
+            landed = page.evaluate(_SUBMISSION_PROBE, ONLINE_TYPE_BOXES)
+            got = ",".join((landed or {}).get("types") or [])
+            if set(got.split(",")) != {p.strip() for p in value.split(",") if p.strip()}:
+                snapshot = save_debug_snapshot(
+                    page, f"submission-reverted-{assignment_id}")
+                raise WriteRefused(
+                    f"assignment {assignment_id}: set Submission Type to "
+                    f"{value!r} but the form now holds {got!r}. Nothing was "
+                    f"saved. Snapshot: {snapshot}"
+                )
+            written.append(
+                Written(assignment_id=assignment_id, field=column,
+                        wanted=value, typed=got, confirmed=""))
+            continue
+
         field = FORM_FIELDS.get(column)
         if field is None:
             raise WriteRefused(
