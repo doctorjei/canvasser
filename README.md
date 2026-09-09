@@ -17,8 +17,8 @@ automation is the better-supported path for this institution.
 >
 > **Assignment settings** — points, grading type, submission types, allowed attempts,
 > publish state — are pulled to a second CSV. Writing them is newer than the date path:
-> `points_possible` and `grading_type` can be written, the rest are reported as not yet
-> writable rather than silently ignored.
+> points, grading type, submission types and allowed attempts can be written. Anything not
+> yet writable is reported rather than silently ignored.
 >
 > **Not supported:** assignments with per-student or per-section overrides. Saving Canvas's
 > edit form submits *every* date card, so getting that wrong deletes an accommodation date.
@@ -266,8 +266,9 @@ because there is nothing for it to mark.
 
 - Rows are matched on `assignment_id` alone. **There is no `override_id`** — these settings
   are per assignment, not per date card.
-- **Read-only columns:** `title`, `kind`, `assignment_group`, `override_count`. They are
-  written so the sheet is legible and ignored on the way back in.
+- **Read-only columns:** `kind`, `assignment_group`, `override_count`. They are written so
+  the sheet is legible and ignored on the way back in. (`title` is editable — see below —
+  but a rename is reported rather than written, pending a flag that does not exist yet.)
 - **`kind` explains the blanks.** A classic quiz's page carries no `grading_type`,
   `submission_types` or `peer_reviews` at all, so those cells are empty on every quiz row —
   that is a fact about quizzes, not a failed read.
@@ -278,8 +279,29 @@ because there is nothing for it to mark.
 
 ### What `push` writes from it
 
-**`points_possible` and `grading_type` today.** Edits to the other columns are reported per
-row as `NOT WRITABLE YET` and skipped — never silently dropped.
+**`points_possible`, `grading_type`, `submission_types` and `allowed_attempts` today.**
+Edits to the other columns are reported per row as `NOT WRITABLE YET` and skipped — never
+silently dropped.
+
+Each is compared by **meaning rather than text**, so a spreadsheet's reformatting is not
+mistaken for an edit: points numerically (`8.34` = `8.340`), submission types as a set
+(order does not matter), attempts as an integer (`3` = `3.0`). Comparing these as strings
+would report a change nobody made, write it, and report it again on every push afterwards.
+
+**Renaming is recognised but not yet written.** A changed `title` is reported as needing
+`--rename`, a flag that does not exist yet — the gate is built, the write is not. The gate
+is deliberate: the title is also the column you read to find your row, so an edit made to
+keep the sheet legible should not quietly rename what students see.
+
+**`submission_types`** takes the online sub-types (`online_upload`, `online_text_entry`,
+`online_url`, `media_recording`, `student_annotation`) or a whole mode (`none`, `on_paper`).
+`external_tool` is refused: it needs a tool URL this sheet has no column for, so writing it
+would leave an assignment configured for a tool it does not have.
+
+**`allowed_attempts`** takes a positive count, or `-1` for unlimited — Canvas's own
+encoding, which is what the sheet carries. Canvas hides the control unless the assignment
+accepts submissions, so limiting attempts on a `none` submission type is refused, naming
+`submission_types` as the thing to set first.
 
 `grading_type` takes the option **values**, not the words on the form: `points`, `percent`,
 `letter_grade`, `gpa_scale`, `pass_fail`, `not_graded`. Anything else is refused before a
