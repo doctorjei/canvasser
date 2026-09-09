@@ -1,11 +1,18 @@
-"""GatorLink SSO login and session liveness.
+"""SSO login and session liveness.
 
-The liveness check exploits a quirk of this Canvas instance mapped during
-reconnaissance: an *unauthenticated* request to the Canvas root redirects out to
-elearning.ufl.edu, while an authenticated one stays on ufl.instructure.com and
-renders the dashboard. That makes "which host did we end up on" a reliable,
-markup-independent signal -- far more durable than probing for some element that
-Canvas may restyle next term.
+The liveness check rests on a fact mapped during reconnaissance: an
+*unauthenticated* request to the Canvas root is redirected away, while an
+authenticated one stays put and renders the dashboard. "Which host did we end
+up on" is therefore a reliable, markup-independent signal -- far more durable
+than probing for some element Canvas may restyle next term.
+
+**It is an allowlist: authenticated iff we are still on the configured Canvas
+host.** It used to be a denylist of the two hosts UF bounces to, which meant
+every new institution had to enumerate every host it might land on -- and
+recon 2026-09-09 showed those hosts are not even the same *kind* of thing.
+UF's unauthenticated root lands on `elearning.ufl.edu`, a WordPress help site;
+Temple's lands on `fim.temple.edu`, the IdP itself. One allowlist covers both
+with no per-institution configuration, and it is the simpler code.
 """
 
 from __future__ import annotations
@@ -15,9 +22,14 @@ import sys
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout
 
 from .browser import save_debug_snapshot
-from .config import Config, IDP_HOST
+from .config import Config, IDP_HOST, canvas_host
+from .credentials import PASSWORD_VAR, USERNAME_VAR
 from .duo import Approver, PushApprover, complete_duo, on_duo_page
 
+#: UF's unauthenticated landing site -- a WordPress help site, NOT the IdP.
+#: No longer part of the liveness decision (see the module docstring); kept
+#: because "never point tooling at elearning.ufl.edu" is a standing rule and
+#: the name is what makes that rule findable.
 ELEARNING_HOST = "elearning.ufl.edu"
 
 USERNAME_FIELD = "input[name='j_username']"
@@ -69,11 +81,19 @@ def is_logged_in(page: Page, config: Config) -> bool:
     """Return whether the persistent session still has us authenticated."""
     page.goto(config.base_url, wait_until="domcontentloaded")
     quiesce(page)
-    return _looks_authenticated(page.url)
+    return _looks_authenticated(page.url, config)
 
 
-def _looks_authenticated(url: str) -> bool:
-    return ELEARNING_HOST not in url and IDP_HOST not in url
+def _looks_authenticated(url: str, config: Config) -> bool:
+    """Whether this URL means we are logged in to THIS Canvas.
+
+    **An allowlist of one host**, not a denylist of the places we might have
+    been sent. Compared on the parsed hostname rather than by substring: a
+    substring test would call `https://evil.example/?ufl.instructure.com`
+    authenticated, and would also match a host that merely ends with the right
+    letters.
+    """
+    return canvas_host(url) == config.host
 
 
 def _submit_credentials(page: Page, config: Config) -> None:
@@ -88,7 +108,7 @@ def _submit_credentials(page: Page, config: Config) -> None:
     except PlaywrightTimeout as exc:
         snapshot = save_debug_snapshot(page, "login-form-missing")
         raise LoginError(
-            f"GatorLink login form never appeared (url={page.url}). Snapshot: {snapshot}"
+            f"The SSO login form never appeared (url={page.url}). Snapshot: {snapshot}"
         ) from exc
 
     page.fill(USERNAME_FIELD, config.username)
@@ -103,6 +123,14 @@ def _check_for_credential_rejection(page: Page) -> None:
     Worth being decisive here: repeatedly submitting a wrong password is how
     accounts get locked out, which is a far worse outcome than an early error.
     """
+    # **Still UF-specific, and deliberately so.** This reads the IdP page's own
+    # words, so it can only speak for an IdP whose wording has been seen. A
+    # different institution's IdP is simply not matched here and the login
+    # fails later with its own message -- which is honest. Widening it to "any
+    # host that is not Canvas" would let an unrelated page's use of the word
+    # "invalid" report a credential rejection that never happened, and the
+    # consequence of a false positive here is a user retyping a correct
+    # password.
     if IDP_HOST not in page.url:
         return
     body = page.inner_text("body").lower()
@@ -110,8 +138,9 @@ def _check_for_credential_rejection(page: Page) -> None:
         if phrase in body and "password" in body:
             snapshot = save_debug_snapshot(page, "login-rejected")
             raise LoginError(
-                "GatorLink rejected the credentials. Check GATORLINK_USERNAME / "
-                f"GATORLINK_PASSWORD in the secrets file. Snapshot: {snapshot}"
+                f"The identity provider at {IDP_HOST} rejected the credentials. "
+                f"Check {USERNAME_VAR} / {PASSWORD_VAR} in the secrets file. "
+                f"Snapshot: {snapshot}"
             )
 
 
@@ -124,7 +153,7 @@ def log_in(page: Page, config: Config, approver: Approver | None = None) -> None
     quiesce(page)
 
     # A still-valid IdP session can carry us straight through without a form.
-    if _looks_authenticated(page.url):
+    if _looks_authenticated(page.url, config):
         _log("IdP session still valid; no credentials needed.")
         return
 
@@ -149,7 +178,7 @@ def log_in(page: Page, config: Config, approver: Approver | None = None) -> None
     # mid-chain and reports failure for a login that is merely still in flight.
     # This produced a "not authenticated" error for a session that was, in fact,
     # sitting on the Canvas dashboard.
-    if not _wait_until_authenticated(page):
+    if not _wait_until_authenticated(page, config):
         snapshot = save_debug_snapshot(page, "login-incomplete")
         raise LoginError(
             f"Login flow finished but we are not authenticated (url={page.url}). "
@@ -158,11 +187,13 @@ def log_in(page: Page, config: Config, approver: Approver | None = None) -> None
     _log(f"Authenticated. Landed on {page.url}")
 
 
-def _wait_until_authenticated(page: Page, timeout_ms: int = 30_000) -> bool:
+def _wait_until_authenticated(
+    page: Page, config: Config, timeout_ms: int = 30_000,
+) -> bool:
     """Give the post-Duo redirect chain time to actually finish."""
     waited = 0
     while waited < timeout_ms:
-        if _looks_authenticated(page.url):
+        if _looks_authenticated(page.url, config):
             return True
         page.wait_for_timeout(1_000)
         waited += 1_000

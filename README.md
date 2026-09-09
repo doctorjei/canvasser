@@ -1,7 +1,8 @@
 # canvasser
 
-Automation for UF Canvas (`ufl.instructure.com`) that **navigates the site as a person
-would**, rather than through the REST API.
+Automation for Canvas (`*.instructure.com`) that **navigates the site as a person would**,
+rather than through the REST API. Built against UF; other institutions need one setting
+(see [Scope](#scope-official-instructure-hosts-only)).
 
 That choice is deliberate. UF [discontinued API token
 support](https://elearning.ufl.edu/instructor-help/api-tokens/) after Instructure began
@@ -15,10 +16,10 @@ automation is the better-supported path for this institution.
 > values are read back out of the form before saving, Canvas's own error messages are read
 > after, and the stored value is re-read from the page's state afterwards.
 >
-> **Assignment settings** — points, grading type, submission types, allowed attempts,
-> publish state — are pulled to a second CSV. Writing them is newer than the date path:
-> points, grading type, submission types and allowed attempts can be written. Anything not
-> yet writable is reported rather than silently ignored.
+> **Assignment settings** — points, grading type, submission types, allowed attempts, peer
+> review, publish state — are pulled to a second CSV. Writing them is newer than the date
+> path: everything but publish state can be written. Anything not yet writable is reported
+> rather than silently ignored.
 >
 > **Not supported:** assignments with per-student or per-section overrides. Saving Canvas's
 > edit form submits *every* date card, so getting that wrong deletes an accommodation date.
@@ -40,6 +41,7 @@ canvasser pull 580777 --info          # just info-580777.csv
 canvasser push dates-580777.csv       # show what would change; writes nothing
 canvasser push dates-580777.csv --commit   # actually write it
 canvasser install-browser             # fetch Chromium up front (usually automatic)
+canvasser --institution templeu status     # a different Canvas, with its own session
 ```
 
 `push` previews by default. Running it repeatedly while editing a sheet cannot touch the
@@ -61,7 +63,8 @@ ASCII drawing on a terminal that cannot render box characters.
 ## Requirements
 
 - Python 3.10+ (developed and tested on 3.13)
-- A UF GatorLink account with Duo MFA
+- A Canvas account at an `*.instructure.com` institution (developed against
+  UF GatorLink with Duo MFA)
 - No display required — runs headless
 
 ## Install
@@ -115,17 +118,24 @@ data; the directory is created mode 700.)
 | `$XDG_STATE_HOME/canvasser` | otherwise — usually `~/.local/state/canvasser` |
 
 Set **`$CANVASSER_HOME`** to put it somewhere else; that is the only thing that overrides the
-platform default. Use it to keep state on a durable or encrypted volume, or to run two
-identities side by side.
+platform default. Use it to keep state on a durable or encrypted volume.
+
+For a second *institution*, use `--institution <subdomain>` rather than a second
+`$CANVASSER_HOME`: it keeps that Canvas's credentials, session and browser profile in a
+subdirectory of the same state directory, so the two cannot overwrite each other's login.
+The account you already have stays exactly where it is.
 
 ## Credentials
 
 Resolved per field, first source that has them wins:
 
 1. `--secrets-file PATH` (`--username` supplies the name)
-2. `$GATORLINK_USERNAME` / `$GATORLINK_PASSWORD`
+2. `$CANVAS_USERNAME` / `$CANVAS_PASSWORD`
 3. `canvas.env` in the state directory above (mode `600`)
 4. an interactive prompt
+
+The former `$GATORLINK_USERNAME` / `$GATORLINK_PASSWORD` spellings are still read, so an
+existing `canvas.env` keeps working; `-v` reports them as deprecated.
 
 **There is deliberately no `--password` flag.** OpenSSH is the model: argv is not private —
 it lands in shell history and `/proc/<pid>/cmdline` is world-readable. For scripted runs,
@@ -355,9 +365,24 @@ the GNU General Public License as published by the Free Software Foundation, eit
 of the License, or (at your option) any later version. It comes with **absolutely no
 warranty**.
 
-## Scope: this is a UF tool
+## Scope: official Instructure hosts only
 
-`CANVAS_BASE_URL` is overridable, but the login path is not: the SSO deep link
-(`/login/saml/355`) and the identity provider (`login.ufl.edu`) are UF's, and the second
-factor assumes Duo. Another institution's Canvas will read fine only if you can already
-authenticate to it some other way — sign-in is not portable as written.
+Built against UF and extended to other institutions. Point it elsewhere with
+`--institution <subdomain>`, which keeps that Canvas's credentials, saved session and
+browser profile in their own directory — so a second account cannot overwrite the first's
+session. Selection follows the usual precedence: `--institution`, then
+`$CANVAS_INSTITUTION`, then `default_institution` in the secrets file, then the account you
+already set up.
+
+Two things another institution must supply, because neither is guessable:
+
+- **`CANVAS_SSO_PATH`** — the Canvas login route. There is deliberately no default:
+  `/login/saml/355` is *UF's own* SAML provider id, and using it elsewhere would send your
+  credentials to UF's identity provider. Unset, a non-UF institution is refused.
+- **A supported second factor.** Duo is what has been implemented and tested. The factor
+  sits behind an interface, so another one is an addition rather than a rewrite — but it is
+  not written yet.
+
+**Only `*.instructure.com` hosts are supported.** Self-hosted and vanity-domain Canvas are
+refused outright: the institution is identified by its subdomain, and a host without one
+would make two different schools indistinguishable in the state directory.

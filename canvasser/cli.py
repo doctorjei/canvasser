@@ -80,7 +80,14 @@ from .writer import (
     verify_settings,
 )
 from .selection import COURSE_VAR, CourseSelectionError, select_course
-from .config import Config, ConfigError, ENV_FILE, load_config
+from .config import (
+    DEFAULT_INSTITUTION_SETTING,
+    ENV_FILE,
+    INSTITUTION_VAR,
+    Config,
+    ConfigError,
+    load_config,
+)
 from .credentials import (
     PASSWORD_VAR,
     USERNAME_VAR,
@@ -101,10 +108,32 @@ def config_from_args(args: argparse.Namespace) -> "Config":
         username=args.username,
         secrets_file=Path(args.secrets_file) if args.secrets_file else None,
         allow_prompt=not args.no_prompt,
+        institution=getattr(args, "institution", None),
     )
     if args.verbose:
         print(f"  Credentials: {config.credential_sources}", file=sys.stderr)
+        print(f"  Canvas: {config.base_url} (institution {config.institution})",
+              file=sys.stderr)
+        print(f"  State: {config.profile_dir.parent}", file=sys.stderr)
     return config
+
+
+def browser_args(config: "Config", args: argparse.Namespace) -> dict:
+    """Everything `open_page` needs, decided in ONE place.
+
+    **The paths come from the config, not from module constants**, because they
+    are per-institution: two Canvases sharing one `storage_state.json` means
+    logging in to the second silently destroys the first's session. Gathered
+    here rather than spelled out at each of the nine call sites, so a tenth
+    cannot be written that quietly uses the defaults -- the arity trap that
+    shipped 0.1.8.
+    """
+    return {
+        "headless": not args.headed,
+        "on_missing_browser": browser_installer(args),
+        "profile_dir": config.profile_dir,
+        "session_file": config.session_state_file,
+    }
 
 
 def browser_installer(args: argparse.Namespace):
@@ -146,8 +175,7 @@ def cmd_install_browser(args: argparse.Namespace) -> int:
 
 def cmd_status(args: argparse.Namespace) -> int:
     config = config_from_args(args)
-    with open_page(headless=not args.headed,
-                   on_missing_browser=browser_installer(args)) as page:
+    with open_page(**browser_args(config, args)) as page:
         alive = is_logged_in(page, config)
     print("Session: ALIVE (authenticated)" if alive else "Session: DEAD (login required)")
     return 0 if alive else 1
@@ -156,8 +184,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 def cmd_login(args: argparse.Namespace) -> int:
     config = config_from_args(args)
     approver = APPROVERS[args.factor]()
-    with open_page(headless=not args.headed,
-                   on_missing_browser=browser_installer(args)) as page:
+    with open_page(**browser_args(config, args)) as page:
         performed = ensure_logged_in(page, config, approver)
     print("Logged in." if performed else "Already logged in; nothing to do.")
     return 0
@@ -167,8 +194,7 @@ def cmd_courses(args: argparse.Namespace) -> int:
     """Read the course list off the Courses page, as a person would see it."""
     config = config_from_args(args)
     approver = APPROVERS[args.factor]()
-    with open_page(headless=not args.headed,
-                   on_missing_browser=browser_installer(args)) as page:
+    with open_page(**browser_args(config, args)) as page:
         ensure_logged_in(page, config, approver)
         courses = apply_scope(fetch_courses(page, config), scope_from_args(args))
 
@@ -240,8 +266,7 @@ def cmd_settings(args: argparse.Namespace) -> int:
     if not chosen:
         chosen = ["general"]
 
-    with open_page(headless=not args.headed,
-                   on_missing_browser=browser_installer(args)) as page:
+    with open_page(**browser_args(config, args)) as page:
         ensure_logged_in(page, config, approver)
         course = _resolve_course(page, config, args)
         settings = fetch_settings(page, config, course.id)
@@ -383,8 +408,7 @@ def cmd_pull(args: argparse.Namespace) -> int:
     print(f"  Fetching assignment details from "
           f"{args.course or 'the selected course'}...")
 
-    with open_page(headless=not args.headed,
-                   on_missing_browser=browser_installer(args)) as page:
+    with open_page(**browser_args(config, args)) as page:
         print("  Connecting...", end="", flush=True)
         ensure_logged_in(page, config, approver)
         # Duo's box, if it appeared, was written to stderr straight through the
@@ -520,8 +544,7 @@ def cmd_push_info(args: argparse.Namespace, sheet_path: Path) -> int:
 
     config = config_from_args(args)
     approver = APPROVERS[args.factor]()
-    with open_page(headless=not args.headed,
-                   on_missing_browser=browser_installer(args)) as page:
+    with open_page(**browser_args(config, args)) as page:
         ensure_logged_in(page, config, approver)
         course_id = args.course or sheet.course_id
         if not course_id:
@@ -678,8 +701,7 @@ def cmd_push(args: argparse.Namespace) -> int:
 
     config = config_from_args(args)
     approver = APPROVERS[args.factor]()
-    with open_page(headless=not args.headed,
-                   on_missing_browser=browser_installer(args)) as page:
+    with open_page(**browser_args(config, args)) as page:
         ensure_logged_in(page, config, approver)
         # The sheet names its own course, so there is nothing to resolve --
         # and resolving one from flags would invite pushing into the wrong
@@ -758,8 +780,7 @@ def cmd_push(args: argparse.Namespace) -> int:
     def failed(row_title: str, key: str, why: str) -> None:
         problems.append((f"{row_title}  #{key}", why))
 
-    with open_page(headless=not args.headed,
-                   on_missing_browser=browser_installer(args)) as page:
+    with open_page(**browser_args(config, args)) as page:
         ensure_logged_in(page, config, approver)
         for row in diff.changed:
             wanted = by_key[row.key]
@@ -927,11 +948,22 @@ def build_parser() -> argparse.ArgumentParser:
         f"password flag (ssh's rule: argv is not private). For scripted use, "
         f"sshpass answers the prompt.",
     )
-    creds.add_argument("--username", help="GatorLink username")
+    creds.add_argument("--username", help="Canvas/SSO username")
     creds.add_argument(
         "--secrets-file",
         metavar="PATH",
         help=f"File of KEY=VALUE lines ({USERNAME_VAR}, {PASSWORD_VAR})",
+    )
+    creds.add_argument(
+        "--institution",
+        metavar="SUBDOMAIN",
+        help=(
+            "Which Canvas to use, by its instructure subdomain (e.g. templeu). "
+            f"Its own credentials, session and browser profile live in a "
+            f"subdirectory of the state directory. Defaults to "
+            f"${INSTITUTION_VAR}, then {DEFAULT_INSTITUTION_SETTING} in the "
+            f"secrets file, then the single account already set up."
+        ),
     )
     creds.add_argument(
         "--no-prompt",

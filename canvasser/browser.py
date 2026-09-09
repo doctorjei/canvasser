@@ -115,6 +115,7 @@ def open_context(
     headless: bool = True,
     slow_mo: int = 0,
     on_missing_browser=None,
+    session_file: Path = SESSION_STATE_FILE,
 ) -> Iterator[BrowserContext]:
     """Open the persistent browser context, creating the profile if needed.
 
@@ -153,16 +154,17 @@ def open_context(
             except PlaywrightError as retry_exc:
                 raise _launch_failure(retry_exc) from retry_exc
         context.set_default_timeout(30_000)
-        _restore_session_cookies(context)
+        _restore_session_cookies(context, session_file)
         try:
             yield context
         finally:
             # Save before close: storage_state() needs a live context.
-            _save_session_cookies(context)
+            _save_session_cookies(context, session_file)
             context.close()
 
 
-def _restore_session_cookies(context: BrowserContext) -> None:
+def _restore_session_cookies(context: BrowserContext,
+                             session_file: Path = SESSION_STATE_FILE) -> None:
     """Re-inject cookies saved from a previous run.
 
     A persistent profile is *not* sufficient on its own. Canvas's session cookie
@@ -174,10 +176,10 @@ def _restore_session_cookies(context: BrowserContext) -> None:
     Saving and re-injecting the session ourselves is what makes a login last
     beyond a single process.
     """
-    if not SESSION_STATE_FILE.is_file():
+    if not session_file.is_file():
         return
     try:
-        cookies = json.loads(SESSION_STATE_FILE.read_text()).get("cookies", [])
+        cookies = json.loads(session_file.read_text()).get("cookies", [])
     except (OSError, ValueError):
         return  # A corrupt cache is not worth failing a run over; just re-login.
     if cookies:
@@ -185,7 +187,8 @@ def _restore_session_cookies(context: BrowserContext) -> None:
             context.add_cookies(cookies)
 
 
-def _save_session_cookies(context: BrowserContext) -> None:
+def _save_session_cookies(context: BrowserContext,
+                          session_file: Path = SESSION_STATE_FILE) -> None:
     """Persist cookies, including the session cookies Chromium would discard.
 
     The file is credential-equivalent -- it grants Canvas access without a
@@ -196,9 +199,10 @@ def _save_session_cookies(context: BrowserContext) -> None:
         state = context.storage_state()
     except Exception:
         return
-    SESSION_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    SESSION_STATE_FILE.write_text(json.dumps(state))
-    SESSION_STATE_FILE.chmod(0o600)
+    session_file.parent.mkdir(parents=True, exist_ok=True)
+    session_file.parent.chmod(0o700)
+    session_file.write_text(json.dumps(state))
+    session_file.chmod(0o600)
 
 
 @contextlib.contextmanager
