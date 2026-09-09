@@ -67,6 +67,8 @@ from .push import (
     compare,
     compare_info,
     same_points,
+    same_attempts,
+    same_submission_types,
     to_minute,
     describe_scope,
 )
@@ -594,9 +596,20 @@ def cmd_push_info(args: argparse.Namespace, sheet_path: Path) -> int:
             print(f"  {row.title}  #{row.assignment_id}")
             for change in row.changes:
                 landed = got.get(change.field, "")
-                ok = (same_points(landed, change.after)
-                      if change.field == "points_possible"
-                      else landed == change.after)
+                # **The post-write check must compare the same way the diff
+                # does.** Each of these is a field whose text can differ while
+                # its meaning does not -- `8.340` for `8.34`, a reordered
+                # submission-type list -- and a check that compares text calls
+                # a correct write a failure. `submission_types` did exactly
+                # that live on 2026-09-09.
+                if change.field == "points_possible":
+                    ok = same_points(landed, change.after)
+                elif change.field == "submission_types":
+                    ok = same_submission_types(landed, change.after)
+                elif change.field == "allowed_attempts":
+                    ok = same_attempts(landed, change.after)
+                else:
+                    ok = landed == change.after
                 print(f"      {change.field:<18}{change.before} -> {change.after}"
                       f"   Canvas now: {landed}   {'OK' if ok else 'MISMATCH'}")
                 if not ok:
@@ -605,9 +618,18 @@ def cmd_push_info(args: argparse.Namespace, sheet_path: Path) -> int:
                     # value" (it accepted then altered), as `_why_mismatch`
                     # does for dates. A bare MISMATCH tells the reader nothing
                     # they can act on.
-                    kept = (same_points(landed, change.before)
-                            if change.field == "points_possible"
-                            else landed == change.before)
+                    # Compared the same way as above, for the same reason: this
+                    # decides WHICH failure the user is told about, and text
+                    # equality here reported "neither the old nor the new
+                    # value" about a value that was exactly the new one.
+                    if change.field == "points_possible":
+                        kept = same_points(landed, change.before)
+                    elif change.field == "submission_types":
+                        kept = same_submission_types(landed, change.before)
+                    elif change.field == "allowed_attempts":
+                        kept = same_attempts(landed, change.before)
+                    else:
+                        kept = landed == change.before
                     why = ("Canvas still holds its previous value, so the save "
                            "was rejected -- open the form and read its message"
                            if kept else

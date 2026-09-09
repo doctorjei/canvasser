@@ -602,6 +602,51 @@ _SUBMISSION_PROBE = """(boxes) => {
 }"""
 
 
+#: Allowed Attempts is an **InstUI pair, not a Rails input** (recon
+#: 2026-09-09) -- the opposite of `points_possible`, which sits inches away on
+#: the same form and *is* addressable by a stable semantic id:
+#:
+#:   * the Unlimited/Limited `<select>` has **no `name` at all** and a
+#:     RANDOMLY GENERATED id (`x4ziu7qhl` on the observed load), so neither
+#:     handle survives a second page load;
+#:   * the count box has a render-order counter id (`NumberInput___0`) but a
+#:     stable `name="allowed_attempts"`.
+#:
+#: So the select is found by **the only content that identifies it** -- its
+#: option values -- cross-checked against its label, and the count box by name.
+#: This is the date-field discipline, applied on a form where two neighbouring
+#: fields do not need it.
+_ATTEMPTS_PROBE = """() => {
+    const selects = Array.from(document.querySelectorAll('select')).filter(s => {
+        const values = Array.from(s.options).map(o => o.value).sort();
+        return values.length === 2
+            && values[0] === 'limited' && values[1] === 'unlimited';
+    });
+    const box = document.querySelector('input[name="allowed_attempts"]');
+    const labelOf = (el) => {
+        if (!el) return '';
+        if (el.id) {
+            const l = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+            if (l) return l.textContent.trim();
+        }
+        const wrap = el.closest('label');
+        return wrap ? wrap.textContent.trim() : '';
+    };
+    const seen = (el) => !!(el && (el.offsetParent || el.getClientRects().length));
+    return {
+        // More than one match is not a thing to choose between: the same rule
+        // as the ambiguous Save button, which returns nothing rather than guess.
+        select_count: selects.length,
+        select_label: labelOf(selects[0]),
+        select_value: selects[0] ? selects[0].value : null,
+        select_visible: seen(selects[0]),
+        box_present: !!box,
+        box_label: labelOf(box),
+        box_value: box ? box.value : null,
+        box_visible: seen(box),
+    };
+}"""
+
 #: Selecting this takes the assignment out of the gradebook entirely and hides
 #: its points and dates. Reported loudly rather than refused -- it is a real
 #: thing a person may want -- but it is not a change to make by accident.
@@ -700,6 +745,69 @@ def _write_submission_types(page: Page, assignment_id: str, value: str) -> None:
                 box.set_checked(should)
 
 
+def _write_allowed_attempts(page: Page, assignment_id: str, value: str) -> None:
+    """Set Unlimited/Limited and, when limited, the count.
+
+    `-1` is Canvas's own encoding for unlimited and is what the sheet carries,
+    so it maps to the *select*, not to the number box -- typing `-1` into a
+    count box would be writing a value the control does not mean.
+    """
+    wanted = int(float(value.strip()))
+    mode = "unlimited" if wanted == -1 else "limited"
+
+    found = page.evaluate(_ATTEMPTS_PROBE)
+    if found["select_count"] > 1:
+        snapshot = save_debug_snapshot(page, f"attempts-ambiguous-{assignment_id}")
+        raise WriteFailed(
+            f"{found['select_count']} Unlimited/Limited selects on {page.url}; "
+            f"this control has no id or name to tell them apart, so refusing "
+            f"rather than choosing one. Snapshot: {snapshot}"
+        )
+    if not found["select_count"] or not found["box_present"]:
+        snapshot = save_debug_snapshot(page, f"no-attempts-{assignment_id}")
+        raise WriteFailed(
+            f"no Allowed Attempts control on {page.url}. Canvas's assignment "
+            f"form has changed and this must be re-checked before any write. "
+            f"Snapshot: {snapshot}"
+        )
+    # The control exists in the DOM even when Canvas has hidden it -- an
+    # assignment set to "No Submission" has nothing to limit attempts of.
+    # Writing into a hidden control is how a value gets set and then discarded
+    # on save, which reads as success.
+    if not found["select_visible"]:
+        raise WriteRefused(
+            f"assignment {assignment_id}: Canvas hides Allowed Attempts unless "
+            f"the assignment accepts submissions. Set submission_types in the "
+            f"same row (or in Canvas) before limiting attempts."
+        )
+    # Labels are checked as a prefix: this one is a WRAPPING label, so its text
+    # is the caption run together with the option words --
+    # "Allowed AttemptsUnlimitedLimited".
+    if not found["select_label"].strip().lower().startswith("allowed attempts"):
+        snapshot = save_debug_snapshot(page, f"attempts-label-{assignment_id}")
+        raise WriteFailed(
+            f"the Unlimited/Limited select on {page.url} is labelled "
+            f"{found['select_label']!r}, not 'Allowed Attempts'. Refusing to "
+            f"write into a control that may no longer be the one meant. "
+            f"Snapshot: {snapshot}"
+        )
+
+    page.locator("select").filter(
+        has=page.locator("option[value='unlimited']")).first.select_option(mode)
+
+    if mode == "limited":
+        # The count box only matters once Limited is chosen, and Canvas reveals
+        # it in response -- so it is waited for as a state, never slept on.
+        box = page.locator('input[name="allowed_attempts"]')
+        box.wait_for(state="visible", timeout=10_000)
+        box.click()
+        box.fill("")
+        box.type(str(wanted), delay=25)
+        # Enter is never pressed on this form: it submits rather than
+        # committing the field (proved live 2026-08-22).
+        box.evaluate("element => element.blur()")
+
+
 def apply_settings(
     page: Page,
     config: Config,
@@ -742,7 +850,33 @@ def apply_settings(
         )
 
     written: list[Written] = []
-    for column, value in changes.items():
+    # **Submission type is set before allowed attempts, and that is a
+    # dependency rather than a preference.** Canvas hides the attempts pair
+    # entirely while the assignment accepts no submissions, so a row that turns
+    # an assignment online *and* limits its attempts only works in that order.
+    # Sorted explicitly: relying on the caller's dict order would make this
+    # correct by accident, and the accident is one refactor from being untrue.
+    order = {"submission_types": 0, "allowed_attempts": 1}
+    for column, value in sorted(changes.items(), key=lambda kv: order.get(kv[0], 0)):
+        if column == "allowed_attempts":
+            _write_allowed_attempts(page, assignment_id, value)
+            page.wait_for_timeout(150)
+            landed = page.evaluate(_ATTEMPTS_PROBE)
+            got = ("-1" if landed["select_value"] == "unlimited"
+                   else (landed["box_value"] or ""))
+            if not _same_number(got, value):
+                snapshot = save_debug_snapshot(
+                    page, f"attempts-reverted-{assignment_id}")
+                raise WriteRefused(
+                    f"assignment {assignment_id}: set Allowed Attempts to "
+                    f"{value!r} but the form now holds {got!r}. Nothing was "
+                    f"saved. Snapshot: {snapshot}"
+                )
+            written.append(
+                Written(assignment_id=assignment_id, field=column,
+                        wanted=value, typed=got, confirmed=""))
+            continue
+
         if column == "submission_types":
             # Its own shape: a select plus five checkboxes, so it does not fit
             # the one-selector FormField table. Same three gates all the same.
@@ -840,6 +974,11 @@ def apply_settings(
     # Gate 3: Canvas reports a rejected save only on the page. Both signals are
     # required together -- a successful save navigates away, and InstUI renders
     # ordinary hints through the same component as errors.
+    #
+    # Shares `_settle_after_save` with the date path deliberately: that helper
+    # exists because a fixed post-save wait raced the navigation and crashed a
+    # live push mid-course, and a second copy of the old pattern here would
+    # wait to do the same thing on the settings path.
     complaints = _settle_after_save(page)
     if complaints:
         snapshot = save_debug_snapshot(page, f"settings-rejected-{assignment_id}")
@@ -862,14 +1001,19 @@ def verify_settings(
     date for minutes after a write whose stored value was correct throughout.
     ENV is what the page itself was built from.
     """
+    # **Formatted by the SAME function the sheet is built with.** `str()` was
+    # used here, which is identical for a number or a string and wrong for a
+    # list: `submission_types` came back `"['online_upload']"` and every write
+    # of it reported MISMATCH while Canvas held exactly what was asked for
+    # (live, 2026-09-09). Two implementations of "how an ENV value becomes a
+    # cell" will eventually disagree, and the one on the verify path is the one
+    # that decides whether a correct write is reported as a failure.
+    from .assignments import _cell
+
     _open_editor(page, config, course_id, assignment_id)
     page.wait_for_function(SUBJECT_READY, timeout=30_000)
     subject = page.evaluate(f"() => {_SUBJECT}")
-    out: dict[str, str] = {}
-    for column in columns:
-        value = (subject or {}).get(column)
-        out[column] = "" if value is None else str(value)
-    return out
+    return {column: _cell((subject or {}).get(column)) for column in columns}
 
 
 def verify(page: Page, config: Config, course_id: str, assignment_id: str) -> dict:

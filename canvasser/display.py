@@ -526,7 +526,8 @@ def render_info_diff(diff) -> list[str]:
     out = [_paint(fit("Info push preview -- nothing has been written", 79),
                   BOLD_WHITE_U), ""]
 
-    if diff.is_empty and not diff.has_unsupported and not diff.has_invalid:
+    if (diff.is_empty and not diff.has_unsupported and not diff.has_invalid
+            and not diff.has_gated):
         out.append(_paint("  No changes. ", BOLD_GREEN)
                    + f"{diff.compared} sheet row(s) match Canvas exactly.")
         return out
@@ -553,6 +554,17 @@ def render_info_diff(diff) -> list[str]:
             # the option value (`points`). Named here so the dry run says which
             # cell to fix, rather than costing a page load each to discover.
             out.append(_paint(f"      {message}", BRIGHT_BOLD_RED))
+        for change in row.gated:
+            # Writable, but not without being asked. Reported for exactly the
+            # same reason as `unsupported`: an edit that vanishes silently
+            # reads as "no change", and the reader has no way to tell the
+            # difference between "nothing to do" and "declined to do it".
+            out.append(
+                f"      {fit(change.field, 18)}"
+                f"{_paint(fit(change.before or '(unset)', 14), GREY)}"
+                f" -> {_paint(change.after, BOLD_GREEN)}"
+                + _paint("   needs --rename", BRIGHT_BOLD_RED)
+            )
         for change in row.unsupported:
             # Reported, never attempted. A column pull writes but push cannot
             # act on is a trap: the edit looks applied because nothing
@@ -582,12 +594,15 @@ def render_info_diff(diff) -> list[str]:
         out.append("")
 
     unsupported = sum(len(r.unsupported) for r in diff.changed)
+    gated = sum(len(r.gated) for r in diff.changed)
     invalid = sum(len(r.invalid) for r in diff.changed)
     graded = sum(1 for r in diff.changed if r.graded and r.changes)
     out.append(
         f"  {len(diff.changed)} row(s), {diff.field_count} field(s) would change"
         + (_paint(f"; {unsupported} edit(s) NOT writable yet", BRIGHT_BOLD_RED)
            if unsupported else "")
+        + (_paint(f"; {gated} rename(s) need --rename", BRIGHT_BOLD_RED)
+           if gated else "")
         + (_paint(f"; {invalid} cell(s) SKIPPED as invalid", BRIGHT_BOLD_RED)
            if invalid else "")
         + (_paint(f"; {graded} already graded", BRIGHT_BOLD_RED) if graded else "")

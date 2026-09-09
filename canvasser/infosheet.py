@@ -104,13 +104,24 @@ class InfoRow:
 
 COLUMNS = tuple(f.name for f in fields(InfoRow))
 
-#: Columns a future `push` could write. Everything else is reported for the
-#: reader's benefit and ignored on the way back in -- editing a title or a
-#: group name in the spreadsheet must never retarget or rename anything.
+#: Columns `push` may write. Everything else is reported for the reader's
+#: benefit and ignored on the way back in.
+#:
+#: **`title` is editable but gated behind `push --rename`** (user, 2026-09-09:
+#: *"it should be editable, unless there is a specific issue with it"*, then
+#: *"we could require a flag to write it"*). Renaming assignments in bulk is a
+#: real course-setup operation, which is the workflow this tool serves. The
+#: flag exists because the title is also the column a reader *navigates* by, so
+#: an edit meant to make the sheet legible should not quietly rename what
+#: students see. Nothing here retargets anything: row identity is
+#: `assignment_id`, so a renamed cell still writes to the row it came from.
 EDITABLE_COLUMNS = (
-    "points_possible", "grading_type", "submission_types",
+    "title", "points_possible", "grading_type", "submission_types",
     "allowed_attempts", "published", "peer_reviews",
 )
+
+#: Editable, but only when the caller asks for it explicitly.
+RENAME_GATED = ("title",)
 
 #: Row 2 groupings, mirroring how the edit form is laid out. Indexes are
 #: derived from COLUMNS rather than written as literals: the `kind` column was

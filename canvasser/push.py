@@ -52,7 +52,8 @@ from dataclasses import dataclass, replace
 
 from .dateparse import convert
 from .datesheet import AssignmentRow, Sheet, SheetError
-from .infosheet import EDITABLE_COLUMNS as INFO_EDITABLE, InfoRow, InfoSheet
+from .infosheet import (EDITABLE_COLUMNS as INFO_EDITABLE, RENAME_GATED,
+                        InfoRow, InfoSheet)
 from .timezones import resolve_friendly
 
 #: The three date pairs, grouped for reporting. Canvas's field name first,
@@ -446,7 +447,63 @@ def align_timezone(
 #: silently ignored -- `pull` populates those columns, so a user will edit one
 #: eventually, and a no-op that looks like a success is the failure mode this
 #: project keeps meeting.
-WRITABLE_INFO_FIELDS = ("points_possible", "grading_type", "submission_types")
+WRITABLE_INFO_FIELDS = (
+    "title", "points_possible", "grading_type", "submission_types",
+    "allowed_attempts",
+)
+
+
+def same_attempts(before: str, after: str) -> bool:
+    """Whether two attempts cells mean the same count.
+
+    Compared as integers: a spreadsheet will rewrite `3` as `3.0`, and a text
+    comparison would report an edit nobody made, write it, and report it again
+    forever -- the trap `same_points` and `to_minute` each exist for. Falls
+    back to string equality so a non-numeric cell is still *reported* rather
+    than swallowed.
+    """
+    a, b = (before or "").strip(), (after or "").strip()
+    if a == b:
+        return True
+    try:
+        return int(float(a)) == int(float(b))
+    except ValueError:
+        return False
+
+
+#: Canvas's own encoding for "no limit", written raw into the sheet because
+#: rendering it as the word "unlimited" would invent vocabulary the sheet then
+#: has to parse back (user-confirmed 2026-08-30).
+UNLIMITED_ATTEMPTS = "-1"
+
+
+def check_allowed_attempts(cell: str) -> str | None:
+    """Why this attempts cell cannot be written, or None if it can.
+
+    Checked before a page is loaded, so a bad cell is named in the dry run
+    rather than costing an edit-page load per row to discover.
+    """
+    text = (cell or "").strip()
+    try:
+        number = int(float(text))
+    except ValueError:
+        return (f"allowed_attempts={cell!r} is not a whole number. Canvas "
+                f"accepts a positive count, or {UNLIMITED_ATTEMPTS} for "
+                f"unlimited")
+    if str(number) != text and float(text) != number:
+        return (f"allowed_attempts={cell!r} is not a whole number -- an "
+                f"assignment cannot be attempted a fraction of a time")
+    if number == 0:
+        # Canvas's own control cannot express this: "Limited" with a count of
+        # zero is not offered, and it would mean an assignment nobody can
+        # submit -- which is what unpublishing is for.
+        return ("allowed_attempts=0 would mean an assignment that cannot be "
+                "attempted at all. Canvas's control does not offer it; "
+                f"use {UNLIMITED_ATTEMPTS} for unlimited, or a positive count")
+    if number < -1:
+        return (f"allowed_attempts={cell!r} is negative. Only "
+                f"{UNLIMITED_ATTEMPTS} has a meaning (unlimited)")
+    return None
 
 #: The `Submission Type` select's own values (recon 2026-09-09). As with
 #: `grading_type`, these are the option VALUES and not the visible words --
@@ -556,6 +613,12 @@ class InfoRowDiff:
     #: value), say. Named at diff time so the dry run says which cell to fix,
     #: rather than costing an edit-page load each to find out.
     invalid: list[str]
+    #: Edits this build CAN write but was not asked to. Today that is `title`,
+    #: behind `push --rename`. Deliberately its own category rather than folded
+    #: into `unsupported`: "not writable yet" and "writable, say so" are
+    #: different facts about the tool, and reporting the second as the first
+    #: would tell the reader to wait for a feature that already exists.
+    gated: list[FieldChange]
     #: True when Canvas says this assignment already has graded submissions.
     #: A points change then re-scales every student's percentage -- 8.34 out of
     #: 8.33 is over 100%. The user chose warn-and-write over refusing
@@ -588,6 +651,10 @@ class InfoDiff:
         return any(row.invalid for row in self.changed)
 
     @property
+    def has_gated(self) -> bool:
+        return any(row.gated for row in self.changed)
+
+    @property
     def field_count(self) -> int:
         return sum(len(row.changes) for row in self.changed)
 
@@ -618,6 +685,7 @@ def compare_info(
     sheet: InfoSheet,
     current: list[InfoRow],
     graded: frozenset[str] = frozenset(),
+    allow_rename: bool = False,
 ) -> InfoDiff:
     """Diff an edited infosheet against freshly read rows.
 
@@ -647,6 +715,7 @@ def compare_info(
 
         changes: list[FieldChange] = []
         unsupported: list[FieldChange] = []
+        gated: list[FieldChange] = []
         invalid: list[str] = []
         for column in INFO_EDITABLE:
             if not sheet.specifies(column):
@@ -666,11 +735,19 @@ def compare_info(
                 # Set comparison, not text: see `same_submission_types`.
                 if same_submission_types(before, after):
                     continue
+            elif column == "allowed_attempts":
+                if same_attempts(before, after):
+                    continue
             elif before == after:
                 continue
             change = FieldChange(field=column, before=before, after=after)
             if column == "submission_types":
                 reason = check_submission_types(after)
+                if reason:
+                    invalid.append(reason)
+                    continue
+            if column == "allowed_attempts":
+                reason = check_allowed_attempts(after)
                 if reason:
                     invalid.append(reason)
                     continue
@@ -685,12 +762,18 @@ def compare_info(
                     f"not the words shown on the form)"
                 )
                 continue
-            if column in WRITABLE_INFO_FIELDS:
+            if column in RENAME_GATED and not allow_rename:
+                # Writable, but not without being asked. Reported so the run
+                # says what it declined to do and how to ask for it -- silence
+                # here would read as "no change", which is the failure mode
+                # this project keeps meeting.
+                gated.append(change)
+            elif column in WRITABLE_INFO_FIELDS:
                 changes.append(change)
             else:
                 unsupported.append(change)
 
-        if changes or unsupported or invalid:
+        if changes or unsupported or gated or invalid:
             changed.append(
                 InfoRowDiff(
                     assignment_id=wanted.key,
@@ -700,6 +783,7 @@ def compare_info(
                     title=have.title or wanted.title or f"assignment {wanted.key}",
                     changes=changes,
                     unsupported=unsupported,
+                    gated=gated,
                     invalid=invalid,
                     graded=wanted.key in graded,
                 )
