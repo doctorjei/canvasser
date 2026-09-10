@@ -511,6 +511,64 @@ def render_diff(diff, sheet) -> list[str]:
     return out
 
 
+def render_creates(plans, refusals) -> list[str]:
+    """What an infosheet push would CREATE, and which rows it will not.
+
+    Rendered separately from the diff rather than folded into it, because a
+    create is not a change to something: it has no before value, no live row to
+    compare against, and its failure mode is the opposite one. A diff that
+    reported "(unset) -> Homework 1" would be describing an edit to an
+    assignment that does not exist.
+
+    **The loud item here is the count itself.** Creation is the one operation
+    this tool cannot undo -- deleting is not built -- so the number of new
+    assignments is stated plainly before anything happens.
+    """
+    if not plans and not refusals:
+        return []
+
+    out = [_paint(fit("New assignments -- nothing has been created", 79),
+                  BOLD_WHITE_U), ""]
+
+    for plan in plans:
+        out.append(_paint(f"  {plan.title}", BOLD_WHITE)
+                   + _paint("   (new)", GREY))
+        for column in sorted(plan.values):
+            if column == "title":
+                continue
+            out.append(f"      {fit(column, 18)}"
+                       f"{_paint(fit('(new)', 14), GREY)}"
+                       f" -> {_paint(plan.values[column], BOLD_GREEN)}")
+        for note in plan.notes:
+            # Not a refusal: a field left to Canvas's own default, said out
+            # loud because a default is only harmless when it is expected.
+            out.append(_paint(f"      note: {note}", GREY))
+        for change in plan.unsupported:
+            out.append(
+                f"      {fit(change.field, 18)}"
+                f"{_paint(fit('(new)', 14), GREY)}"
+                f" -> {_paint(change.after, GREY)}"
+                + _paint("   NOT WRITABLE YET -- ignored", BRIGHT_BOLD_RED)
+            )
+        out.append("")
+
+    for refusal in refusals:
+        out.append(_paint(f"  {refusal.title}", BOLD_WHITE)
+                   + _paint(f"   line {refusal.line}", GREY)
+                   + _paint("   WILL NOT BE CREATED", BRIGHT_BOLD_RED))
+        for reason in refusal.reasons:
+            out.append(_paint(f"      {reason}", BRIGHT_BOLD_RED))
+        out.append("")
+
+    if plans:
+        out.append(_paint(
+            f"  {len(plans)} assignment(s) would be created. ", BOLD_WHITE)
+            + _paint("This cannot be undone from here -- ", BRIGHT_BOLD_RED)
+            + _paint("deleting is not built.", BRIGHT_BOLD_RED))
+        out.append("")
+    return out
+
+
 def render_info_diff(diff) -> list[str]:
     """What an infosheet push would change.
 
@@ -528,6 +586,14 @@ def render_info_diff(diff) -> list[str]:
 
     if (diff.is_empty and not diff.has_unsupported and not diff.has_invalid
             and not diff.has_gated):
+        if not diff.compared:
+            # A sheet of nothing but NEW rows compares no rows at all, and
+            # "0 sheet row(s) match Canvas exactly" reads like a failed match
+            # rather than an empty question. The creates are rendered
+            # separately, above this.
+            out.append(_paint("  No existing rows to compare. ", BOLD_GREEN)
+                       + "Every row in this sheet is a new assignment.")
+            return out
         out.append(_paint("  No changes. ", BOLD_GREEN)
                    + f"{diff.compared} sheet row(s) match Canvas exactly.")
         return out

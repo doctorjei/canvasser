@@ -10,6 +10,10 @@
     canvasser push <sheet.csv> --commit    # write it, verifying each field
     canvasser install-browser      # fetch Chromium (otherwise offered on first use)
 
+A settings-sheet row whose assignment_id reads NEW creates an assignment, and the
+id Canvas assigns is written back into that cell. Assignments only; there is no
+delete command, so anything created by mistake is removed in Canvas by hand.
+
 Credentials come from the first source that has them: --secrets-file, the
 environment, the default secrets file, then a prompt. There is no password flag
 -- argv is not private -- so use a file, an env var, or sshpass for scripted
@@ -42,6 +46,10 @@ from .dateparse import DateFormatError
 from .datesheet import SheetError, read_sheet, write_sheet
 from .infosheet import (
     DATES as SHEET_DATES,
+    NEW as SHEET_NEW,
+    WriteBackFailed,
+    claim_new_row,
+    find_lock,
     read_sheet as read_info_sheet,
     INFO as SHEET_INFO,
     identify as identify_sheet,
@@ -51,6 +59,7 @@ from .progress import course_heading, glyphs_for, session_banner, stat_box
 from .display import (
     print_course_table,
     render_diff,
+    render_creates,
     render_info_diff,
     render_features,
     render_general,
@@ -66,16 +75,19 @@ from .push import (
     check_order,
     compare,
     compare_info,
+    plan_creates,
     same_value,
     to_minute,
     describe_scope,
 )
 from .settings import fetch_settings
 from .writer import (
+    CreateUnrecorded,
     WriteFailed,
     WriteRefused,
     apply_changes,
     apply_settings,
+    create_assignment,
     verify,
     verify_settings,
 )
@@ -533,6 +545,123 @@ def _why_mismatch(previous, got: str, date_column: str, time_column: str,
             f"re-running")
 
 
+def _id_landed(sheet_path: Path, line: int, assignment_id: str) -> bool:
+    """Re-read the sheet and confirm the new id is really in the row it belongs.
+
+    The second of the two guards the user chose (2026-09-10). The first --
+    refusing when an editor's lock file is present -- catches the common case
+    before anything is created; this catches what it misses: a stale lock, an
+    editor nobody listed, or a spreadsheet opened *during* the run.
+
+    Re-reading the whole file rather than trusting the write is the point. It is
+    a local file and costs nothing next to a page load, and the thing being
+    checked is precisely whether something else rewrote it underneath us.
+    """
+    try:
+        again = read_info_sheet(sheet_path)
+    except SheetError:
+        return False
+    return any(at == line and row.assignment_id == assignment_id
+               for at, row in zip(again.lines, again.rows))
+
+
+def _commit_creates(page, config, course_id: str, sheet_path: Path, plans):
+    """Create each planned assignment and record its id, one row at a time.
+
+    Returns `(created, problems, halted)`. **`halted` means stop the whole run**
+    -- not "this row failed", but "the sheet and Canvas may no longer agree, and
+    continuing would make that worse".
+
+    **Recorded per row, the instant each create succeeds -- never batched.** A
+    run that creates three of five and then fails must leave those three
+    written down: a write-back that happened only on a clean finish would turn
+    any mid-run failure into duplicates on the next attempt, which is the exact
+    failure `NEW` exists to prevent.
+    """
+    created: list[tuple[str, str]] = []
+    problems: list[str] = []
+    if not plans:
+        return created, problems, False
+
+    # Asked once, before the first create -- not per row. The question is
+    # whether the file is safe to write to at all, and the answer cannot change
+    # between rows in a way that makes the first create retroactively fine.
+    lock = find_lock(sheet_path)
+    if lock:
+        locked_by, editor = lock
+        print(
+            f"\n  REFUSING to create anything: {sheet_path} looks open in "
+            f"{editor}.\n"
+            f"      Found: {locked_by}\n"
+            f"      `push` records each new assignment's id in this file the "
+            f"moment it is created. If {editor} still has it open, its next "
+            f"save puts {SHEET_NEW} back -- and the next push would create "
+            f"every one of these a SECOND time.\n"
+            f"      Close the file and run this again. Nothing was created.",
+            file=sys.stderr,
+        )
+        return created, problems, True
+
+    for plan in plans:
+        try:
+            new_id, _written, inherited = create_assignment(
+                page, config, course_id, plan.kind, plan.title, plan.values,
+                publish=plan.publish)
+        except (WriteRefused, WriteFailed) as exc:
+            # Nothing was created for this row, so the run may continue: the
+            # row still says NEW, which is exactly what it should say.
+            print(f"  REFUSED {plan.title}: {exc}", file=sys.stderr)
+            problems.append(f"{plan.title} (line {plan.line})")
+            continue
+        except CreateUnrecorded as exc:
+            # Created, id unknown. Continuing would risk a second create on the
+            # next push, and every further row would bury this message.
+            print(f"\n  STOPPING: {exc}", file=sys.stderr)
+            return created, problems, True
+
+        try:
+            claim_new_row(sheet_path, plan.line, new_id)
+        except WriteBackFailed as exc:
+            print(f"\n  STOPPING: {exc}\n"
+                  f"      {plan.title!r} is now assignment {new_id} in Canvas. "
+                  f"Write that id into the sheet by hand, or re-run "
+                  f"`canvasser pull`, before pushing this file again.",
+                  file=sys.stderr)
+            return created, problems, True
+
+        if not _id_landed(sheet_path, plan.line, new_id):
+            print(f"\n  STOPPING: wrote {new_id} into {sheet_path} line "
+                  f"{plan.line}, but reading the file back does not show it.\n"
+                  f"      Something else is writing to this file -- a "
+                  f"spreadsheet with it open is the usual cause.\n"
+                  f"      {plan.title!r} is now assignment {new_id} in Canvas. "
+                  f"Record that id before pushing this file again.",
+                  file=sys.stderr)
+            return created, problems, True
+
+        created.append((new_id, plan.title))
+        print(f"  CREATED {plan.title}  #{new_id}"
+              f"   (line {plan.line} of the sheet now says {new_id})")
+        # **Publish state is stated on every create, both ways.** It is the one
+        # field here a student sees immediately, and it is set by which button
+        # was clicked rather than by a value that would show up in the field
+        # report below -- so without this line a published create and an
+        # unpublished one read identically.
+        print(f"      {'published':<18}"
+              + ("-> true   (saved with 'Save & Publish'; students can see it)"
+                 if plan.publish else
+                 "-> false  (created unpublished; publish it in Canvas)"))
+        # **What the blank columns actually became**, not what they were
+        # assumed to become. Canvas pre-fills its create form from the last
+        # assignment made in this browser, so before that was cleared an
+        # omitted `points_possible` silently inherited a previous create's
+        # value rather than defaulting to 0 (measured 2026-09-10).
+        for column, value in sorted(inherited.items()):
+            print(f"      {column:<18}(blank in the sheet) -> {value}")
+
+    return created, problems, False
+
+
 def cmd_push_info(args: argparse.Namespace, sheet_path: Path) -> int:
     """Compare an edited infosheet against the live course, and optionally write.
 
@@ -548,14 +677,22 @@ def cmd_push_info(args: argparse.Namespace, sheet_path: Path) -> int:
     meeting.
     """
     sheet = read_info_sheet(sheet_path)
+    # Planned before the browser is opened: every reason a `NEW` row cannot be
+    # created is knowable from the sheet alone, so a bad row is named without
+    # spending a login on it.
+    creates, refused_creates = plan_creates(sheet)
     print(
         f"  Sheet: {sheet_path}  (infosheet v{sheet.version or '?'}, "
         f"course={sheet.course_id or '?'}, {len(sheet.rows)} row(s))\n"
         f"  Sheet can change: "
         f"{', '.join(sheet.editable_present) or 'nothing -- no editable column'}\n"
-        f"  This build can write: {', '.join(WRITABLE_INFO_FIELDS)}",
+        f"  This build can write: {', '.join(WRITABLE_INFO_FIELDS)}"
+        + ("" if args.rename else "  (title needs --rename)"),
         file=sys.stderr,
     )
+    if creates or refused_creates:
+        print(f"  New rows: {len(creates)} to create, "
+              f"{len(refused_creates)} refused", file=sys.stderr)
 
     config = config_from_args(args)
     approver = APPROVERS[args.factor]()
@@ -569,23 +706,42 @@ def cmd_push_info(args: argparse.Namespace, sheet_path: Path) -> int:
             )
         check_info_course(sheet, course_id)
 
-        targets = sorted({row.assignment_id for row in sheet.rows})
+        # `NEW` rows name no assignment, so they are not read back. Asking
+        # Canvas for `/assignments/NEW/edit` would spend a page load to be told
+        # what the sheet already said.
+        targets = sorted({row.assignment_id for row in sheet.rows
+                          if not row.is_new})
         print(
             f"\n  Reading {len(targets)} assignment(s) named by the sheet. "
             f"This is the read pass -- nothing is being changed.\n",
             file=sys.stderr,
         )
         live = read_specific_info(page, config, course_id, targets)
-        diff = compare_info(sheet, live.rows, live.graded)
+        diff = compare_info(sheet, live.rows, live.graded,
+                            allow_rename=args.rename)
 
         print()
+        # Creates first: they are the irreversible half, and reading them
+        # before a list of edits puts the consequential thing at the top.
+        create_lines = render_creates(creates, refused_creates)
+        if create_lines:
+            print("\n".join(create_lines))
         print("\n".join(render_info_diff(diff)))
 
+        nothing_to_do = diff.is_empty and not creates
         if not args.commit:
-            return 1 if not diff.is_empty else 0
-        if diff.is_empty:
+            return 1 if not nothing_to_do else 0
+        if nothing_to_do:
             print("\nNothing to commit.")
             return 0
+
+        # Everything below writes. Creates go first: each one has to be
+        # recorded in the sheet before the run may continue, so a failure there
+        # must stop before any edit adds to what has to be explained.
+        created, create_problems, halted = _commit_creates(
+            page, config, course_id, sheet_path, creates)
+        if halted:
+            return 3
 
         # Everything above this line is read-only. Everything below writes.
         #
@@ -613,7 +769,7 @@ def cmd_push_info(args: argparse.Namespace, sheet_path: Path) -> int:
                 print(f"       {row.title}  #{row.assignment_id}", file=sys.stderr)
 
         print()
-        problems: list[str] = []
+        problems: list[str] = list(create_problems)
         for row in diff.changed:
             if not row.changes:
                 continue
@@ -622,7 +778,10 @@ def cmd_push_info(args: argparse.Namespace, sheet_path: Path) -> int:
             # where the assignment holds half the edit.
             wanted = {c.field: c.after for c in row.changes}
             try:
-                apply_settings(page, config, course_id, row.assignment_id, wanted)
+                # `kind` comes from the live read, not the sheet: it aims the
+                # title control, and the two forms share no part of it.
+                apply_settings(page, config, course_id, row.assignment_id,
+                               wanted, kind=row.kind)
                 got = verify_settings(page, config, course_id, row.assignment_id,
                                       tuple(wanted))
             except (WriteRefused, WriteFailed) as exc:
@@ -662,6 +821,17 @@ def cmd_push_info(args: argparse.Namespace, sheet_path: Path) -> int:
                     print(f"      {'':<18}why: {why}", file=sys.stderr)
                     problems.append(
                         f"{row.title} #{row.assignment_id} ({change.field})")
+
+    if created:
+        # Said again at the end, because the create lines scroll past on a long
+        # run and this is the half that cannot be undone from here.
+        print(f"\n{len(created)} assignment(s) created, and each id is now in "
+              f"{sheet_path}:")
+        for new_id, title in created:
+            print(f"      #{new_id}  {title}")
+        print("  Dates are NOT set on a new assignment -- they live in the "
+              "datesheet. Re-run `canvasser pull` to pick these up, then edit "
+              "and push that file.")
 
     if problems:
         print(f"\n{len(problems)} item(s) did not land, each with a reason above:",
@@ -1113,6 +1283,19 @@ def build_parser() -> argparse.ArgumentParser:
     push.add_argument(
         "--commit", action="store_true",
         help="actually write the changes (default is preview only)",
+    )
+    # **Un-gates one column; it does NOT write.** `--commit` remains the write
+    # gate, so `--rename` on its own previews the rename and touches nothing.
+    #
+    # The flag exists because a title edit is the one edit that can be made
+    # *incidentally* -- a person tidying a sheet so it reads better can rename
+    # what students see without meaning to -- and the title is also the column
+    # a reader navigates by. Contrast a `NEW` row, where typing `NEW` into an id
+    # cell cannot happen by accident and so needs no flag.
+    push.add_argument(
+        "--rename", action="store_true",
+        help="allow title changes to be written (infosheet only; still needs "
+             "--commit to write anything)",
     )
     return parser
 

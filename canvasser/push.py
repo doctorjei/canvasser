@@ -6,6 +6,12 @@ more -- no navigation to an edit form, no writes. That separation is
 deliberate: the diff is the thing that gets run over and over while a sheet is
 being edited, and it must never be able to touch the course.
 
+**`plan_creates` is the one thing here that is not a diff**, and it lives here
+for the same reason: it answers "what would be *created*?" from the sheet alone,
+before a page is loaded, so a `NEW` row that cannot be created is named in the
+dry run rather than costing a form load each to discover. It still writes
+nothing.
+
 **The two diffs share a shape and almost no rules.** Row identity is a pair
 here and a single id there; there is no timezone to align on the infosheet; and
 an empty cell means "clear it" for a date but "leave it alone" for a setting.
@@ -52,7 +58,8 @@ from dataclasses import dataclass, replace
 
 from .dateparse import convert
 from .datesheet import AssignmentRow, Sheet, SheetError
-from .infosheet import (EDITABLE_COLUMNS as INFO_EDITABLE, RENAME_GATED,
+from .infosheet import (CREATABLE_COLUMNS, CREATE_ONLY_COLUMNS,
+                        EDITABLE_COLUMNS as INFO_EDITABLE, NEW, RENAME_GATED,
                         InfoRow, InfoSheet)
 from .timezones import resolve_friendly
 
@@ -502,6 +509,22 @@ def check_peer_reviews(cell: str) -> str | None:
     return None
 
 
+def check_published(cell: str) -> str | None:
+    """Why this publish cell cannot be honoured, or None if it can.
+
+    Same shape as `check_peer_reviews` and for the same reason: `pull` writes
+    `true`/`false`, a spreadsheet that recognises those re-saves them as
+    `TRUE`/`FALSE`, and anything outside the accepted vocabulary is refused
+    rather than guessed at in either direction. Guessing wrong here is the one
+    mistake in this file a student would see.
+    """
+    if parse_flag(cell) is None:
+        return (f"published={cell!r} does not name a yes or a no. Canvas "
+                f"accepts {', '.join(FLAG_TRUE)} or {', '.join(FLAG_FALSE)}; "
+                f"`pull` writes true/false")
+    return None
+
+
 def same_attempts(before: str, after: str) -> bool:
     """Whether two attempts cells mean the same count.
 
@@ -688,6 +711,16 @@ class InfoRowDiff:
     #: 8.33 is over 100%. The user chose warn-and-write over refusing
     #: (2026-08-30), so this rides along to be said loudly rather than to block.
     graded: bool = False
+    #: What Canvas says this is -- `assignment` or `quiz` -- taken from the LIVE
+    #: row, never from the sheet's `kind` cell.
+    #:
+    #: Carried because `title` is the one writable field whose control depends
+    #: on it, and the write must not be aimed by a cell the user can edit:
+    #: `kind` is documented read-only on an existing row, so a sheet saying
+    #: `quiz` about an assignment would send `_write_title` looking for
+    #: `#quiz_title` on a page that has `#assignment_name`. The live page is the
+    #: authority about what the thing is, exactly as it is for `title` itself.
+    kind: str = ""
 
 
 @dataclass(frozen=True)
@@ -782,7 +815,222 @@ INFO_CELL_CHECKS = {
     "allowed_attempts": check_allowed_attempts,
     "peer_reviews": check_peer_reviews,
     "grading_type": check_grading_type,
+    # Only ever consulted on a `NEW` row: on an existing one `published` is
+    # still reported `NOT WRITABLE YET`, because the button that publishes is
+    # absent once an assignment already is.
+    "published": check_published,
 }
+
+
+#: What this build can put on a `NEW` row. Deliberately NOT the same tuple as
+#: `WRITABLE_INFO_FIELDS`: it adds the two columns that are read-only on an
+#: existing assignment and mandatory on a new one (`assignment_group`, `kind`),
+#: because *editing never needs to set them and creating always does*.
+#:
+#: **`published` is deliberately still absent, and is now creatable anyway.**
+#: It is not a control on the form -- there is no publish checkbox and never
+#: was -- so it cannot live in the `{column: value}` map that gets typed into
+#: fields. It chooses **which Save button is clicked**, exactly as `kind`
+#: chooses which endpoint is posted to, and it rides on `CreatePlan.publish`
+#: for that reason. Adding it here would send it to `_apply_field_values`,
+#: which would look for a control that does not exist.
+#:
+#: Reconnoitred at last on 2026-09-10 (`archives/recon-scripts/
+#: publish_button_recon.py`), because the claim that "Save & Publish" exists on
+#: the create form came from a probe of `/assignments/new?quiz_lti` -- a
+#: different page -- and was being applied to the plain `/assignments/new`.
+#: It does exist on both: `button.btn.btn-default.save_and_publish`, visible,
+#: no id.
+CREATABLE_INFO_FIELDS = tuple(
+    c for c in CREATABLE_COLUMNS
+    # **`published` is excluded explicitly, not by omission.** The day the edit
+    # path learns to publish -- and the recon says it can, since an UNPUBLISHED
+    # assignment's edit form carries "Save & Publish" too -- somebody will add
+    # `published` to `WRITABLE_INFO_FIELDS`, and it would arrive here through
+    # the first clause and be typed into a control that does not exist. Naming
+    # it here costs one line and closes that door in advance.
+    if c != "published"
+    and (c in WRITABLE_INFO_FIELDS or c in ("assignment_group", "kind"))
+)
+
+#: The only `kind` a `NEW` row may ask for in this build.
+#:
+#: **Quiz creation is mapped but not built**, and refusing is the honest answer
+#: rather than treating a quiz row as an assignment. The three create paths do
+#: not group the way the read paths do -- a New Quiz is created at
+#: `/assignments/new?quiz_lti` and reads back as `kind=quiz`, while a classic
+#: quiz is created through an engine dialog -- so `kind` alone cannot even
+#: choose the endpoint. See `tasks.md` -> "Creating assignments".
+CREATABLE_KINDS = ("assignment",)
+
+
+@dataclass(frozen=True)
+class CreatePlan:
+    """One `NEW` row, validated and ready to be created."""
+
+    #: The line in the sheet whose id cell gets the new assignment's id. See
+    #: `infosheet.claim_new_row` for why this is a line and not a position.
+    line: int
+    title: str
+    #: Which create endpoint this row wants. Kept out of `values` because it is
+    #: not a control on the form -- it *chooses the form*.
+    kind: str
+    #: Column -> value, carrying only what the sheet actually specified. An
+    #: absent column means "let Canvas default it", which on a create form is a
+    #: real and useful answer rather than the "leave alone" it means on an edit.
+    values: dict[str, str]
+    #: Columns the sheet set that this build cannot write on a new assignment.
+    #: Reported, never silently dropped. `title` is the live example while
+    #: `--rename` is unbuilt; `published` used to be and no longer is.
+    unsupported: list[FieldChange]
+    #: Notes worth printing that are not refusals: a field being left to
+    #: Canvas's default where that default may not be what the user expects.
+    notes: list[str]
+    #: Whether to save with **"Save & Publish"** rather than plain "Save".
+    #:
+    #: Kept out of `values` for the same reason `kind` is: it is not a control
+    #: on the form. There is no publish checkbox on an assignment form and
+    #: there never was -- the 2026-09-09 recon that looked for one found zero
+    #: matching controls, selects *and* buttons. Publishing is a different
+    #: **mechanism**, not a different selector, and the mechanism is which
+    #: button gets clicked. A `False` here is not "leave alone": Canvas
+    #: creates unpublished, so it is the state the assignment will be in.
+    publish: bool = False
+
+
+@dataclass(frozen=True)
+class CreateRefusal:
+    """A `NEW` row that cannot be created, and why."""
+
+    line: int
+    title: str
+    reasons: list[str]
+
+
+def plan_creates(
+    sheet: InfoSheet,
+) -> tuple[list[CreatePlan], list[CreateRefusal]]:
+    """Turn the sheet's `NEW` rows into creates, or into reasons they cannot be.
+
+    Judged **before any page is loaded**, exactly as the cell checks are, so the
+    dry run names the row to fix instead of costing a form load each to find
+    out. Nothing here touches Canvas.
+    """
+    plans: list[CreatePlan] = []
+    refused: list[CreateRefusal] = []
+
+    for line, row in sheet.new_rows:
+        reasons: list[str] = []
+        notes: list[str] = []
+        values: dict[str, str] = {}
+        unsupported: list[FieldChange] = []
+
+        title = (row.title or "").strip()
+        if not sheet.specifies("title") or not title:
+            # The one field Canvas itself marks required (recon 2026-09-10,
+            # marked three ways at once), and the one this cannot default.
+            reasons.append(
+                "a new assignment needs a title -- the `title` cell is the "
+                "only field Canvas requires, and there is nothing to fall back "
+                "on")
+
+        kind = (row.kind or "").strip().lower()
+        if kind and kind not in CREATABLE_KINDS:
+            reasons.append(
+                f"kind={row.kind!r} cannot be created by this build. Only "
+                f"{', '.join(CREATABLE_KINDS)} is built; quiz creation forks by "
+                f"engine (classic vs New Quizzes) and the sheet has no column "
+                f"that expresses the choice. Create the quiz in Canvas, then "
+                f"`pull` again to manage it here")
+        elif not kind:
+            notes.append("kind is blank; creating a plain assignment")
+
+        # **Every column a person might set, not only the ones that work.**
+        # Iterating `CREATABLE_COLUMNS` here looked right and was the bug: it is
+        # the list of what CAN be created, so a `published=true` cell -- the one
+        # editable column no build can write -- was skipped in silence. `pull`
+        # populates that column, so someone will edit it, and a no-op that looks
+        # like success is the failure this project keeps meeting.
+        for column in INFO_EDITABLE + CREATE_ONLY_COLUMNS:
+            # `published` is skipped here and handled below, NOT because it is
+            # unwritable -- it is writable on a create now -- but because it is
+            # not a field. It picks the Save button, so putting it in `values`
+            # would send it to `_apply_field_values` to hunt for a control that
+            # does not exist. Same reason `kind` is skipped.
+            if column in ("title", "kind", "published") \
+                    or not sheet.specifies(column):
+                continue
+            value = (getattr(row, column) or "").strip()
+            if not value:
+                continue
+            if column not in CREATABLE_INFO_FIELDS:
+                unsupported.append(
+                    FieldChange(field=column, before="", after=value))
+                continue
+            check = INFO_CELL_CHECKS.get(column)
+            problem = check(value) if check else None
+            if problem:
+                reasons.append(problem)
+                continue
+            values[column] = value
+
+        # **Publishing is a button, not a field.** `Save & Publish` sits beside
+        # the ordinary Save on the create form (measured 2026-09-10), so a
+        # `NEW` row asking for `published=true` is served by clicking the other
+        # button rather than by setting anything.
+        publish = False
+        if sheet.specifies("published"):
+            cell = (row.published or "").strip()
+            if cell:
+                problem = check_published(cell)
+                if problem:
+                    reasons.append(problem)
+                else:
+                    publish = bool(parse_flag(cell))
+
+        # **A refusal, and it was a note until Canvas was actually asked.**
+        # Leaving this out means Canvas's default of `online` with no sub-type
+        # ticked, and on 2026-09-10 a live create of exactly that came back
+        #
+        #     Please choose at least one submission type
+        #
+        # so the row can never be created as written. It was a note rather than
+        # a refusal while that was unknown -- refusing on a guess risks
+        # refusing a legal write -- and it is measured now, in Canvas's own
+        # words, which is the standard this project holds a pre-check to.
+        if "submission_types" not in values:
+            reasons.append(
+                "a new assignment needs submission_types. Left blank, Canvas "
+                "defaults to Online with nothing ticked and refuses the save "
+                "with \"Please choose at least one submission type\"")
+        if "points_possible" not in values:
+            # Canvas's own default, and only reachable because `writer` clears
+            # the remembered new-assignment settings first; without that this
+            # would inherit the last create's points.
+            notes.append("points_possible is blank; Canvas defaults it to 0")
+        if "assignment_group" not in values:
+            notes.append(
+                "assignment_group is blank; Canvas puts it in the first group")
+        if not publish:
+            # Stated even though it is the safe direction. A create is the one
+            # operation with no undo, and "I made it and nobody can see it" is
+            # a surprise worth one line -- the opposite surprise would be far
+            # worse, which is why unpublished is the default rather than a
+            # thing to be argued into.
+            notes.append(
+                "published is blank or false; the assignment will be created "
+                "UNPUBLISHED and students will not see it")
+
+        label = title or f"(untitled row at line {line})"
+        if reasons:
+            refused.append(CreateRefusal(line=line, title=label, reasons=reasons))
+        else:
+            plans.append(CreatePlan(line=line, title=title,
+                                    kind=kind or CREATABLE_KINDS[0],
+                                    values=values, unsupported=unsupported,
+                                    notes=notes, publish=publish))
+
+    return plans, refused
 
 
 def compare_info(
@@ -811,6 +1059,13 @@ def compare_info(
     missing: list[InfoRow] = []
 
     for wanted in sheet.rows:
+        # **A `NEW` row is not a diff.** It names no assignment, so comparing it
+        # would land it in `missing` -- reported as "the sheet names an
+        # assignment this course does not have", which is true of the id and
+        # exactly backwards about the intent. Creates are planned separately, by
+        # `plan_creates`.
+        if wanted.is_new:
+            continue
         seen.add(wanted.key)
         have = live.get(wanted.key)
         if have is None:
@@ -868,6 +1123,9 @@ def compare_info(
                     gated=gated,
                     invalid=invalid,
                     graded=wanted.key in graded,
+                    # From the live row, like the title above it: the sheet's
+                    # own `kind` cell is read-only and may say anything.
+                    kind=have.kind,
                 )
             )
 
@@ -876,7 +1134,9 @@ def compare_info(
         changed=changed,
         missing=missing,
         untouched=untouched,
-        compared=len(sheet.rows),
+        # Rows actually compared, so a sheet of five creates does not report
+        # "5 row(s) match Canvas exactly" about rows that are not in Canvas.
+        compared=sum(1 for row in sheet.rows if not row.is_new),
     )
 
 

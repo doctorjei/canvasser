@@ -19,9 +19,15 @@ automation is the better-supported path for this institution.
 > **Assignment settings** — points, grading type, submission types, allowed attempts, peer
 > review, publish state — are pulled to a second CSV. Writing them is newer than the date
 > path: points, grading type, submission types, allowed attempts and peer review can be
-> written. **Publish state cannot**, and a changed title is reported as needing a `--rename`
-> flag that does not exist yet. Anything not writable is reported rather than silently
-> ignored.
+> written, and a title with `--rename`. **Publish state can be set only on a brand-new
+> assignment**, not changed on one that already exists. Anything not writable is reported
+> rather than silently ignored.
+>
+> **New assignments** can be created from the settings sheet: put `NEW` in the id cell and
+> the id Canvas assigns is written straight back into it, so the row becomes an ordinary
+> edit and a second push cannot create a duplicate. Assignments only — quizzes are refused,
+> since the two engines use different endpoints. **There is no delete command**, so anything
+> created by mistake has to be removed in Canvas by hand.
 >
 > **Not supported:** assignments with per-student or per-section overrides. Saving Canvas's
 > edit form submits *every* date card, so getting that wrong deletes an accommodation date.
@@ -42,6 +48,7 @@ canvasser pull 580777 --dates         # just dates-580777.csv
 canvasser pull 580777 --info          # just info-580777.csv
 canvasser push dates-580777.csv       # show what would change; writes nothing
 canvasser push dates-580777.csv --commit   # actually write it
+canvasser push info-580777.csv --commit    # settings, and any NEW rows
 canvasser install-browser             # fetch Chromium up front (usually automatic)
 canvasser --institution templeu status     # a different Canvas, with its own session
 ```
@@ -174,7 +181,8 @@ need no interaction at all.
 | favorite | **favorites only** | `--favorite` / `--unmarked`; `--all` opens every axis |
 
 **Naming both sides of an axis unions them** — `--active --archived` is every enrollment,
-which is what the words say. Favorites is the one deliberately narrowed default — it is the list you curate in Canvas
+which is what the words say. Favorites is the one deliberately narrowed default — it is
+the list you curate in Canvas
 itself, via the star on the Courses page. Canvas's own "Current Enrollments" is not a useful
 definition of current: on a long-lived account it is mostly sandboxes and dev shells.
 
@@ -280,7 +288,10 @@ because there is nothing for it to mark.
   are per assignment, not per date card.
 - **Read-only columns:** `kind`, `assignment_group`, `override_count`. They are written so
   the sheet is legible and ignored on the way back in. (`title` is editable — see below —
-  but a rename is reported rather than written, pending a flag that does not exist yet.)
+  but only with `--rename`; without it a changed title is reported and skipped.)
+  **Two of them open up on a `NEW` row:** `kind` and `assignment_group` must be settable
+  when *creating*, since a new assignment has to be put in a group and the two kinds use
+  different endpoints. Editing never needs either; creating always does.
 - **`kind` explains the blanks.** A classic quiz's page carries no `grading_type`,
   `submission_types` or `peer_reviews` at all, so those cells are empty on every quiz row —
   that is a fact about quizzes, not a failed read.
@@ -292,8 +303,15 @@ because there is nothing for it to mark.
 ### What `push` writes from it
 
 **`points_possible`, `grading_type`, `submission_types`, `allowed_attempts` and
-`peer_reviews` today.** `published` is the one remaining column, reported per row as
-`NOT WRITABLE YET` and skipped — never silently dropped.
+`peer_reviews` today.** `published` is the one remaining column on an **existing** row,
+reported per row as `NOT WRITABLE YET` and skipped — never silently dropped.
+
+**On a `NEW` row, `published` does work**: Canvas offers a "Save & Publish" button beside
+the ordinary Save while an assignment is unpublished, so a new assignment can be created
+already visible to students. Left blank or set to `false`, it is created unpublished, and
+`push` says so for every row it creates. If that button is missing, the create is **refused**
+rather than saved unpublished — a create you asked to publish must not quietly arrive
+invisible.
 
 Each is compared by **meaning rather than text**, so a spreadsheet's reformatting is not
 mistaken for an edit: points numerically (`8.34` = `8.340`), submission types as a set
@@ -301,10 +319,22 @@ mistaken for an edit: points numerically (`8.34` = `8.340`), submission types as
 (`TRUE` = `true`, which is what a spreadsheet writes back). Comparing these as strings
 would report a change nobody made, write it, and report it again on every push afterwards.
 
-**Renaming is recognised but not yet written.** A changed `title` is reported as needing
-`--rename`, a flag that does not exist yet — the gate is built, the write is not. The gate
-is deliberate: the title is also the column you read to find your row, so an edit made to
-keep the sheet legible should not quietly rename what students see.
+**Renaming needs `--rename`.** A changed `title` is reported and skipped unless you ask
+for it:
+
+    canvasser push info-580777.csv --rename            # preview the rename
+    canvasser push info-580777.csv --rename --commit   # write it
+
+`--rename` un-gates the one column; it does not write anything on its own, and `--commit`
+remains the only flag that writes. The gate is deliberate: the title is also the column you
+read to find your row, so an edit made to keep the sheet legible should not quietly rename
+what students see. Nothing is retargeted either way — rows are matched on `assignment_id`,
+so a renamed cell still writes to its own row.
+
+Length is not pre-checked. Canvas's quiz form declares a 254-character limit and its
+assignment form declares none, so the limit that applies is read off the form itself: an
+over-long title is truncated by the box, the read-back no longer matches what was asked
+for, and the write refuses before saving rather than silently storing a shortened name.
 
 **`submission_types`** takes the online sub-types (`online_upload`, `online_text_entry`,
 `online_url`, `media_recording`, `student_annotation`) or a whole mode (`none`, `on_paper`).
@@ -334,6 +364,41 @@ Changing points on an assignment that **already has graded submissions** re-scal
 student's percentage, so it is called out against the row and again before writing. It is a
 warning, not a refusal — the write proceeds.
 
+### Creating assignments: put `NEW` in the id cell
+
+Add a row whose `assignment_id` reads `NEW`, give it a `title` and a `submission_types`,
+and `push --commit` creates it. **The id Canvas assigns is written straight back into that
+cell**, so the next push is an ordinary edit rather than a second assignment. That
+write-back is what makes creating safe to re-run — it is the only thing this tool does
+that cannot simply be repeated.
+
+```
+assignment_id,title,kind,assignment_group,points_possible,grading_type,submission_types,...
+NEW,Homework 1,assignment,Exercises,10,points,online_upload,...
+```
+
+- **You must supply `title` and `submission_types`.** Canvas defaults the rest — `0` points,
+  the first assignment group, `points` grading — and every default you are relying on is
+  named in the preview and again in the result, because a default is only harmless when it
+  is expected. `submission_types` is required because Canvas's own default is "Online with
+  nothing ticked", which it then refuses to save: *"Please choose at least one submission
+  type."*
+- **`assignment_group` and `kind` become writable on a `NEW` row**, and only there. Editing
+  an assignment never needs to set them; creating one always does. The group is named the
+  way the sheet shows it — the group's own name, not its id.
+- **Quizzes are not built.** `kind=quiz` is refused rather than quietly made an assignment:
+  classic quizzes and New Quizzes are created at different endpoints and the sheet has no
+  column that says which you mean. Create the quiz in Canvas and `pull` again.
+- **Close the file first.** `push` refuses to create anything while your spreadsheet still
+  has the sheet open, and re-reads the file after each write-back to confirm the id landed.
+  If a spreadsheet saved `NEW` back over a real id, the next push would create a duplicate.
+- **A new assignment has no dates**, because dates live in the other sheet. Run
+  `canvasser pull` afterwards to pick the new rows up, then edit and push the datesheet.
+
+Nothing is created without `--commit`. A plain `push` lists what it would create, with the
+count stated plainly — **there is no delete command**, so an assignment created by mistake
+has to be removed in Canvas by hand.
+
 ### When something fails, it says why
 
 Every failure prints its reason against the line it happened on, rather than a bare count.
@@ -353,8 +418,11 @@ This repository is public.
 - `storage_state.json` (the saved session) is **credential-equivalent** — it grants Canvas
   access with no password.
 - The browser profile holds live session cookies and is **as sensitive as the password**.
-- Debug snapshots render real Canvas pages, which can include student data. They are written
-  outside the repository on purpose.
+- Debug snapshots render real Canvas pages, so they are written outside the repository on
+  purpose — and **a page that names students is not captured at all**. Gradebooks, rosters,
+  SpeedGrader, submissions and an assignment whose "Assign to" cards target individuals are
+  refused before anything is written; a short text note recording the URL and the reason is
+  left in place of the screenshot, so a failure there is still visible.
 - Pulled CSVs are gitignored: they will contain per-student rows once individual overrides
   are in scope.
 

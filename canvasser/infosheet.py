@@ -32,6 +32,27 @@ worth stating rather than leaving implicit: the datesheet's identity rules are
 the obvious thing to copy across out of symmetry, and copying them would import
 a problem this sheet does not have.
 
+## Creating: the `NEW` row
+
+An `assignment_id` of **`NEW`** means *create this assignment*, and `push --commit` writes
+the id Canvas assigns straight back into that cell (user's design, 2026-09-09). That
+write-back is what makes creation re-runnable: after the first push the row holds a real
+id, so every later push is an ordinary edit rather than a second assignment.
+
+Consequences that live in this module:
+
+* **`NEW` rows are exempt from the duplicate-key check.** Five creates are five rows all
+  reading `NEW`; the check exists because two rows naming *one* assignment leave no way to
+  say which wins, and that ambiguity does not arise here.
+* **`InfoSheet.lines` records where each row was read from**, so `claim_new_row` can put an
+  id back in the exact cell it came from. Matching by position among the `NEW` rows would
+  be wrong the moment one create fails: that row stays `NEW` and would collect the next id.
+* **Two normally read-only columns open up** on such a row -- `CREATE_ONLY_COLUMNS`
+  (`assignment_group`, `kind`) -- because editing never needs to set them and creating
+  always does.
+* **`find_lock` exists because the user's workflow is a spreadsheet**, and a spreadsheet
+  holds the file open. See its docstring.
+
 ## Header
 
 Three rows, matching the datesheet's shape so a spreadsheet round-trips them
@@ -62,6 +83,28 @@ SCHEMA_VERSION = "1"
 #: Row 1, first cell. Distinct from the datesheet's marker on purpose -- this is
 #: what lets `push` tell the two files apart before it parses a single row.
 HEADER = re.compile(r"#\s*canvasser infosheet v(?P<version>[^\s,]+)")
+
+#: The `assignment_id` cell that means **create this assignment** (user,
+#: 2026-09-09: *"That spreadsheet should be both read from and written to."*).
+#:
+#: **Why a marker and not a blank.** Creation is the first non-idempotent thing
+#: this tool does: a blank-id row pushed twice would create the assignment
+#: twice. `push` therefore writes the real id back into this cell the instant
+#: the create succeeds, so the second push is an ordinary edit. `NEW` cannot
+#: collide with a Canvas id, which is always numeric -- which is exactly what a
+#: blank could not promise, since a blank is also what a half-edited row looks
+#: like.
+#:
+#: **Matched case-insensitively**, though `pull` and the docs say `NEW`. There
+#: is no numeric id spelled "new", so nothing is ambiguous; and the alternative
+#: is that a row typed `new` reads as an assignment with id "new", which is
+#: reported as missing from the course -- true, unhelpful, and a puzzle.
+NEW = "NEW"
+
+
+def is_new(assignment_id: str) -> bool:
+    """Whether this id cell asks for a new assignment rather than naming one."""
+    return (assignment_id or "").strip().upper() == NEW
 
 
 @dataclass(frozen=True)
@@ -101,6 +144,11 @@ class InfoRow:
         """What a future push would match on. No override_id: see module docs."""
         return self.assignment_id
 
+    @property
+    def is_new(self) -> bool:
+        """Whether this row asks for an assignment to be created. See `NEW`."""
+        return is_new(self.assignment_id)
+
 
 COLUMNS = tuple(f.name for f in fields(InfoRow))
 
@@ -122,6 +170,27 @@ EDITABLE_COLUMNS = (
 
 #: Editable, but only when the caller asks for it explicitly.
 RENAME_GATED = ("title",)
+
+#: Columns that are read-only on an existing row but **must** be settable on a
+#: `NEW` one, for the same underlying reason in both cases: *editing never needs
+#: to set them, creating always does.*
+#:
+#: `assignment_group` because an assignment is always in exactly one group, and
+#: `kind` because assignment and quiz are different create endpoints -- a `NEW`
+#: row has to declare which it is rather than be guessed at. Note this is the
+#: one place the sheet's own read-only marking has an exception, which is why it
+#: is a named constant rather than a condition spelled out at each use.
+CREATE_ONLY_COLUMNS = ("assignment_group", "kind")
+
+#: `title` is NOT rename-gated on a `NEW` row. `--rename` exists because a title
+#: edit can be made incidentally, while tidying a sheet for legibility, and must
+#: not quietly rename what students see. A new assignment has no previous title
+#: to protect and cannot be created without one, so the gate would only stand
+#: between the user and the row they explicitly asked for.
+CREATABLE_COLUMNS = ("title",) + CREATE_ONLY_COLUMNS + (
+    "points_possible", "grading_type", "submission_types",
+    "allowed_attempts", "peer_reviews",
+)
 
 #: Row 2 groupings, mirroring how the edit form is laid out. Indexes are
 #: derived from COLUMNS rather than written as literals: the `kind` column was
@@ -191,9 +260,26 @@ class InfoSheet:
     #: was in a position to change.
     columns: tuple[str, ...]
     path: Path
+    #: The 1-based line each row was read from, parallel to `rows`.
+    #:
+    #: **Carried beside the rows rather than on `InfoRow`**, because `InfoRow`'s
+    #: fields ARE the columns (`COLUMNS` is derived from them), so a field added
+    #: there would add a column to everybody's CSV.
+    #:
+    #: This exists so `claim_new_row` can put a created assignment's id back in
+    #: the exact cell it came from. Matching by position among the `NEW` rows
+    #: would be wrong the moment one create fails: the failed row stays `NEW`,
+    #: and the next id would land on it.
+    lines: tuple[int, ...] = ()
 
     def specifies(self, column: str) -> bool:
         return column in self.columns
+
+    @property
+    def new_rows(self) -> list[tuple[int, InfoRow]]:
+        """The rows asking to be created, each with the line it came from."""
+        return [(line, row) for line, row in zip(self.lines, self.rows)
+                if row.is_new]
 
     @property
     def editable_present(self) -> tuple[str, ...]:
@@ -206,7 +292,16 @@ class InfoSheet:
 def read_sheet(path: Path) -> InfoSheet:
     """Read an infosheet back, tolerating the preamble and spreadsheet re-saves."""
     with path.open(newline="", encoding="utf-8-sig") as handle:
-        records = list(csv.reader(handle))
+        reader = csv.reader(handle)
+        records: list[list[str]] = []
+        # `line_num` counts lines consumed from the file, so it stays correct
+        # when a quoted cell spans several -- which a spreadsheet will produce
+        # from a description or a multi-line title. Recorded per record because
+        # `claim_new_row` edits one line in place and must not guess which.
+        ends_at: list[int] = []
+        for record in reader:
+            records.append(record)
+            ends_at.append(reader.line_num)
 
     course_id = version = None
     for record in records:
@@ -244,7 +339,9 @@ def read_sheet(path: Path) -> InfoSheet:
     present = tuple(c for c in COLUMNS if c in header)
 
     rows: list[InfoRow] = []
-    for line, record in enumerate(records[start + 1:], start=start + 2):
+    lines: list[int] = []
+    for offset, record in enumerate(records[start + 1:], start=start + 1):
+        line = ends_at[offset]
         if not any(cell.strip() for cell in record):
             continue  # A trailing blank line a spreadsheet left behind.
         values = dict(zip(header, record))
@@ -253,9 +350,12 @@ def read_sheet(path: Path) -> InfoSheet:
             raise SheetError(
                 f"{path} line {line} has no assignment_id. Rows are matched on "
                 f"it alone -- a row without one cannot be matched to anything, "
-                f"and guessing would target the wrong assignment."
+                f"and guessing would target the wrong assignment. To create a "
+                f"new assignment, put {NEW} in the cell rather than leaving it "
+                f"empty."
             )
         rows.append(InfoRow(**data))
+        lines.append(line)
 
     duplicates = _duplicate_keys(rows)
     if duplicates:
@@ -269,11 +369,118 @@ def read_sheet(path: Path) -> InfoSheet:
         version=version,
         columns=present,
         path=path,
+        lines=tuple(lines),
     )
 
 
 def _major(version: str) -> str:
     return (version or "").split(".", 1)[0].strip()
+
+
+class WriteBackFailed(Exception):
+    """The created assignment's id could not be recorded in the sheet.
+
+    Always serious. The assignment **exists in Canvas** by the time this can be
+    raised, and the row still says `NEW` -- so a second push would create it
+    again. The caller must stop rather than continue.
+    """
+
+
+def _first_field(text: str) -> tuple[str, str]:
+    """Split a raw CSV line into its first field and the rest, quotes honoured.
+
+    Hand-rolled rather than run through `csv`, because the point is to leave
+    every *other* byte of the line exactly as it was: re-emitting the row
+    through `csv.writer` would re-decide its quoting, and a sheet the user has
+    open would then show a diff nobody asked for.
+    """
+    quoted = False
+    for index, char in enumerate(text):
+        if char == '"':
+            quoted = not quoted
+        elif char == "," and not quoted:
+            return text[:index], text[index:]
+    return text, ""
+
+
+def claim_new_row(path: Path, line: int, assignment_id: str) -> None:
+    """Replace one `NEW` cell with a real assignment id, changing nothing else.
+
+    **Surgical on purpose.** The sheet's contract lets a user delete any column
+    and any row, so rebuilding the file from the parsed model would hand those
+    columns back and silently undo their edit. Only the first field of the named
+    line is touched; every other byte, including quoting and line endings, is
+    written back as it was read.
+
+    Raises `WriteBackFailed` when the line is not where it was, or no longer
+    says `NEW`. **That refusal is the point, not an inconvenience:** it is what a
+    spreadsheet re-saving the file underneath us looks like, and writing an id
+    into whatever now occupies that line would put a real assignment's id on the
+    wrong row.
+    """
+    try:
+        with path.open("r", newline="", encoding="utf-8") as handle:
+            text = handle.read()
+    except OSError as exc:
+        raise WriteBackFailed(f"{path} could not be re-read: {exc}") from exc
+
+    lines = text.splitlines(keepends=True)
+    if not 1 <= line <= len(lines):
+        raise WriteBackFailed(
+            f"{path} no longer has a line {line} (it has {len(lines)}). The "
+            f"file changed while the push was running; assignment "
+            f"{assignment_id} was created but its id is NOT recorded."
+        )
+
+    head, rest = _first_field(lines[line - 1])
+    if not is_new(head.strip().strip('"')):
+        raise WriteBackFailed(
+            f"{path} line {line} now reads {head.strip()!r}, not {NEW}. The "
+            f"file changed while the push was running; assignment "
+            f"{assignment_id} was created but its id is NOT recorded."
+        )
+
+    lines[line - 1] = assignment_id + rest
+    try:
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            handle.write("".join(lines))
+    except OSError as exc:
+        raise WriteBackFailed(
+            f"{path} could not be written: {exc}. Assignment {assignment_id} "
+            f"was created but its id is NOT recorded."
+        ) from exc
+
+
+#: How the editors a person actually opens a CSV in announce that they hold it.
+#: `<name>` is the sheet's own filename; `<stem>` is it without the extension.
+LOCK_PATTERNS = (
+    (".~lock.{name}#", "LibreOffice"),
+    ("~${name}", "Excel"),
+    ("~${stem}.xlsx", "Excel"),
+    (".{name}.swp", "vim"),
+)
+
+
+def find_lock(path: Path) -> tuple[Path, str] | None:
+    """An editor's lock file for this sheet, and which editor left it.
+
+    **Checked before any assignment is created**, because the write-back that
+    follows a create is `push`'s first write to a file the user owns. The user's
+    stated workflow is a spreadsheet, and a spreadsheet holds the file open: if
+    they are still in it when the id lands, their next save puts `NEW` back and
+    the following push creates a **duplicate assignment**. That is the exact
+    failure the `NEW` marker exists to prevent, arriving through the back door.
+
+    A lock file is evidence, not proof -- a crashed editor leaves a stale one,
+    and an editor nobody listed here leaves none. So this is one of the two
+    guards the user chose (2026-09-10); the other is re-reading the sheet after
+    each write-back, which catches what this misses.
+    """
+    for pattern, editor in LOCK_PATTERNS:
+        candidate = path.parent / pattern.format(name=path.name, stem=path.stem)
+        if candidate.exists():
+            return candidate, editor
+    return None
 
 
 #: What `identify` returns. `None` means row 1 named neither sheet -- which is
@@ -315,6 +522,13 @@ def _duplicate_keys(rows: list[InfoRow]) -> list[str]:
     seen: set[str] = set()
     repeated: list[str] = []
     for row in rows:
+        # **`NEW` rows are exempt, and must be.** Creating five assignments is
+        # five rows all reading NEW; the duplicate check exists because two rows
+        # naming one assignment leave no way to tell which wins, and two rows
+        # asking for a new assignment have no such ambiguity -- they are two
+        # different assignments.
+        if row.is_new:
+            continue
         if row.key in seen:
             repeated.append(row.key)
         seen.add(row.key)

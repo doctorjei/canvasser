@@ -72,6 +72,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime
+from urllib.parse import urlparse
 
 from playwright.sync_api import (Error as PlaywrightError, Page,
                                  TimeoutError as PlaywrightTimeout)
@@ -269,9 +270,24 @@ _MARK_CLEAR = """(label) => {
 #: (`formFieldMessages` > `formFieldMessages__message` > `formFieldMessage`),
 #: so the live page shows one complaint three times. Observed 2026-08-22:
 #: "Until date cannot be before due date", x3.
+#: Canvas renders a rejected save in more than one shape, and matching only the
+#: first one means a real refusal is read as silence.
+#:
+#: `formFieldMessage` is InstUI's wrapper and was all this matched until
+#: 2026-09-10, when a live create was rejected with **"Please choose at least
+#: one submission type"** and this returned nothing -- so the run fell through
+#: and reported the assignment as possibly CREATED. That message is an InstUI
+#: `Text` carrying `color="danger"` and a hashed class, with no
+#: `formFieldMessage` anywhere above it. `.error_text`/`.errorBox` are the
+#: classic Rails spellings, kept for the parts of the form that are not InstUI.
+#:
+#: **Still paired with "did we stay on the form"** by every caller, because
+#: InstUI renders ordinary hints through these components too.
 _FIELD_MESSAGES = """() => {
     const seen = new Set();
-    document.querySelectorAll('[class*="formFieldMessage"]').forEach(e => {
+    const sel = '[class*="formFieldMessage"], [color="danger"],'
+              + ' .error_text, .errorBox';
+    document.querySelectorAll(sel).forEach(e => {
         if (e.offsetParent === null) return;
         const text = (e.textContent || '').replace(/\\s+/g, ' ').trim();
         if (text) seen.add(text);
@@ -350,11 +366,43 @@ SUBJECT_READY = "() => !!(window.ENV && (window.ENV.ASSIGNMENT || window.ENV.QUI
 _SUBJECT = "(window.ENV?.ASSIGNMENT || window.ENV?.QUIZ || {})"
 
 
+#: How many DISTINCT "Assign to" cards this assignment carries.
+#:
+#: **The two lists overlap, and this used to add them.** Canvas puts the same
+#: overrides in `ENV.ASSIGNMENT.assignment_overrides` and in
+#: `ENV.ASSIGNMENT_OVERRIDES`, so summing counts each one twice: an assignment
+#: with a single override reported "2 override(s)" the first time this refusal
+#: ever met real data (2026-09-10 -- no course had had one until one was made
+#: for the purpose).
+#:
+#: The decision was never wrong, since any non-zero count refuses. Two other
+#: things were: the message told the user a number that was not true, and it
+#: **disagreed with the sheet's own `override_count`**, which reads only
+#: `ENV.ASSIGNMENT_OVERRIDES` and said 1. Two implementations of "how many
+#: overrides are there", differing in the one place a person compares them.
+#:
+#: Deduplicated by id. An entry with no id cannot be matched against another
+#: list, so it is counted where it is found -- erring toward over-counting,
+#: which errs toward refusing, which is the safe direction here.
+_OVERRIDE_COUNT = f"""() => {{
+    const lists = [{_SUBJECT}.assignment_overrides,
+                   window.ENV?.ASSIGNMENT_OVERRIDES];
+    const ids = new Set();
+    let unidentified = 0;
+    for (const list of lists) {{
+        if (!Array.isArray(list)) continue;
+        for (const card of list) {{
+            if (!card) continue;
+            if (card.id != null) ids.add(String(card.id));
+            else unidentified++;
+        }}
+    }}
+    return ids.size + unidentified;
+}}"""
+
+
 def read_overrides(page: Page) -> int:
-    return page.evaluate(
-        f"() => ({_SUBJECT}.assignment_overrides || []).length"
-        " + (window.ENV?.ASSIGNMENT_OVERRIDES || []).length"
-    )
+    return page.evaluate(_OVERRIDE_COUNT)
 
 
 def profile_timezone(page: Page) -> str:
@@ -553,19 +601,30 @@ FORM_FIELDS = {
         values=("points", "percent", "letter_grade", "gpa_scale", "pass_fail",
                 "not_graded"),
     ),
-    # **The simplest control on this form** (recon 2026-09-09) -- and simple is
-    # a finding, not an assumption: the two fields before it were a Rails text
-    # input and a `<select>` labelled something other than its own name, and
-    # `allowed_attempts` inches away is an InstUI pair with no `name` at all.
+    # **Addressed by name and type, because THE ID DIFFERS BETWEEN THE TWO
+    # FORMS** -- found by the first live create, 2026-09-10:
     #
-    # Its Rails hidden companion is named `peer_reviews_hidden`, a DIFFERENT
-    # name from the checkbox -- unlike the submission sub-types, where the box
-    # and its hidden partner share one and the box must be picked out by type.
-    # Two adjacent controls, two conventions; the id is used here because it
-    # identifies the checkbox alone, and the `name` check below confirms it.
+    #                   edit form                        create form
+    #     id            #assignment_peer_reviews_checkbox #assignment_peer_reviews
+    #     hidden twin   peer_reviews_hidden              peer_reviews (SAME name)
+    #     widget        InstUI, facade over the input    classic Rails checkbox
+    #
+    # This was `#assignment_peer_reviews_checkbox`, on the recorded reasoning
+    # that the id was safe *because* the hidden companion had a different name.
+    # That reasoning was true and **true only of the edit form**: on the create
+    # form the id does not exist at all, so the locator matched nothing and the
+    # first live create was refused. "The create form IS the edit form" holds
+    # for points, grading type and the submission controls; it stops here.
+    #
+    # `input[type=checkbox][name=...]` is the one handle both forms share -- and
+    # it is the pattern the sub-type boxes already use, for the very situation
+    # the create form turns out to have: a box and a hidden partner sharing one
+    # name, told apart by type. More than one match is refused rather than
+    # chosen, since on a form carrying both shapes there would be no way to say
+    # which is meant.
     "peer_reviews": FormField(
         column="peer_reviews",
-        selector="#assignment_peer_reviews_checkbox",
+        selector='input[type=checkbox][name="peer_reviews"]',
         label="Require Peer Reviews",
         name="peer_reviews",
         kind="checkbox",
@@ -676,12 +735,21 @@ _ATTEMPTS_PROBE = """() => {
 NOT_GRADED = "not_graded"
 
 _FIELD_PROBE = """(selector) => {
-    const el = document.querySelector(selector);
+    const all = document.querySelectorAll(selector);
+    const el = all[0];
     if (!el) return null;
     const label = el.id
         ? document.querySelector(`label[for="${CSS.escape(el.id)}"]`) : null;
     const style = window.getComputedStyle(el);
     return {
+        // How many controls the selector matched. A `#id` can only ever match
+        // one; an attribute selector can match several, and choosing between
+        // them is the guess this project refuses everywhere else.
+        count: all.length,
+        // The element's OWN id, which is not derivable from the selector once
+        // that selector stops being `#id` -- and `_write_checkbox` needs it to
+        // find the label it must click.
+        id: el.id || '',
         value: el.value ?? '',
         // **A checkbox's `value` is not its state** -- it reads `on` whether
         // ticked or not, so reading `value` here would call every write a
@@ -752,8 +820,28 @@ def _write_checkbox(
         return  # already right; clicking here would turn it off
     # `label[for=...]` rather than the input: the facade lives inside the label,
     # and clicking the label is what a person does.
-    label = page.locator(f'label[for="{field.selector.lstrip("#")}"]')
-    target = label if label.count() == 1 else page.locator(field.selector)
+    #
+    # **Found from the ELEMENT, not from the selector string.** This built
+    # `label[for="{selector minus a leading #}"]`, which silently assumed every
+    # checkbox is addressed by id -- and produced
+    # `label[for="input[type=checkbox][name=..."]`, not a valid selector at all,
+    # the moment `peer_reviews` moved to a name+type lookup to work on both
+    # forms (2026-09-10). Deriving a second selector from the text of the first
+    # is the kind of shortcut that holds until the first one changes shape.
+    label = None
+    element_id = (found or {}).get("id") or ""
+    if element_id:
+        by_for = page.locator(f'label[for="{element_id}"]')
+        if by_for.count() == 1:
+            label = by_for
+    if label is None:
+        # Both real forms wrap the input in its label, so this covers the case
+        # where the probe's id is unavailable; a non-wrapping `label[for=...]`
+        # is handled above.
+        wrapping = page.locator(field.selector).locator("xpath=ancestor::label[1]")
+        if wrapping.count() == 1:
+            label = wrapping
+    target = label if label is not None else page.locator(field.selector)
     try:
         target.click()
     except PlaywrightError as exc:
@@ -892,47 +980,27 @@ def _write_allowed_attempts(page: Page, assignment_id: str, value: str) -> None:
         box.evaluate("element => element.blur()")
 
 
-def apply_settings(
-    page: Page,
-    config: Config,
-    course_id: str,
-    assignment_id: str,
-    changes: dict[str, str],
+def _apply_field_values(
+    page: Page, subject: str, changes: dict[str, str]
 ) -> list[Written]:
-    """Set an assignment's non-date settings and save. **This writes.**
+    """Set every named settings field on a form that is already open and ready.
 
-    `changes` maps infosheet column -> wanted value. **Every field is set on
-    one form load and committed by one save**, exactly as `apply_changes` does
-    with the three dates. Saving once per field would mean two page loads, two
-    saves, and a window where the assignment holds half the edit.
+    **Shared by `apply_settings` and `create_assignment`**, which is the whole
+    point of it being a function. The create form IS the edit form for
+    assignments -- same ids, same five sub-type checkboxes, same InstUI attempts
+    pair including its per-load random id (recon 2026-09-10) -- so a second copy
+    of this loop would be a second place for a field to be added to one and not
+    the other. That seam is not hypothetical: three parallel copies of the
+    *comparison* rule are what made a correct `submission_types` write report
+    MISMATCH on a live course.
 
-    Structurally identical to `apply_changes`, deliberately: the gates below
-    were each learned by being wrong on a live course, and a second write path
-    that skipped any of them would re-learn them the same expensive way.
+    `subject` is used only for messages and snapshot labels, so a create can
+    pass something that is not an id yet.
 
-    1. the form must be genuinely ready (`FORM_READY`), never a fixed sleep;
-    2. every typed value is read back out of the DOM *before* saving;
-    3. Canvas's own field messages are read after saving.
-
-    `verify_settings` then re-reads ENV, which is the fourth and final check.
+    It does **not** save. The caller owns the save and the checks around it,
+    because those genuinely differ: an accepted edit navigates off `/edit`, an
+    accepted create off `/new`.
     """
-    _open_editor(page, config, course_id, assignment_id)
-    wait_for_form(page)
-
-    # **The override refusal carries across, and the reason is not obvious.**
-    # `points_possible` is per-assignment, so the value itself has nothing to
-    # do with any accommodation -- but saving this form submits every "Assign
-    # to" date card, so writing points to an assignment carrying overrides can
-    # still delete a student's accommodation date. Same hazard, reached from a
-    # direction that looks unrelated.
-    overrides = read_overrides(page)
-    if overrides:
-        raise WriteRefused(
-            f"assignment {assignment_id} has {overrides} override(s). Saving "
-            f"this form submits every date card, so writing its settings could "
-            f"delete a student's accommodation date. Refusing."
-        )
-
     written: list[Written] = []
     # **Submission type is set before allowed attempts, and that is a
     # dependency rather than a preference.** Canvas hides the attempts pair
@@ -943,41 +1011,41 @@ def apply_settings(
     order = {"submission_types": 0, "allowed_attempts": 1}
     for column, value in sorted(changes.items(), key=lambda kv: order.get(kv[0], 0)):
         if column == "allowed_attempts":
-            _write_allowed_attempts(page, assignment_id, value)
+            _write_allowed_attempts(page, subject, value)
             page.wait_for_timeout(150)
             landed = page.evaluate(_ATTEMPTS_PROBE)
             got = ("-1" if landed["select_value"] == "unlimited"
                    else (landed["box_value"] or ""))
             if not _same_number(got, value):
                 snapshot = save_debug_snapshot(
-                    page, f"attempts-reverted-{assignment_id}")
+                    page, f"attempts-reverted-{subject}")
                 raise WriteRefused(
-                    f"assignment {assignment_id}: set Allowed Attempts to "
+                    f"assignment {subject}: set Allowed Attempts to "
                     f"{value!r} but the form now holds {got!r}. Nothing was "
                     f"saved. Snapshot: {snapshot}"
                 )
             written.append(
-                Written(assignment_id=assignment_id, field=column,
+                Written(assignment_id=subject, field=column,
                         wanted=value, typed=got, confirmed=""))
             continue
 
         if column == "submission_types":
             # Its own shape: a select plus five checkboxes, so it does not fit
             # the one-selector FormField table. Same three gates all the same.
-            _write_submission_types(page, assignment_id, value)
+            _write_submission_types(page, subject, value)
             page.wait_for_timeout(150)
             landed = page.evaluate(_SUBMISSION_PROBE, ONLINE_TYPE_BOXES)
             got = ",".join((landed or {}).get("types") or [])
             if set(got.split(",")) != {p.strip() for p in value.split(",") if p.strip()}:
                 snapshot = save_debug_snapshot(
-                    page, f"submission-reverted-{assignment_id}")
+                    page, f"submission-reverted-{subject}")
                 raise WriteRefused(
-                    f"assignment {assignment_id}: set Submission Type to "
+                    f"assignment {subject}: set Submission Type to "
                     f"{value!r} but the form now holds {got!r}. Nothing was "
                     f"saved. Snapshot: {snapshot}"
                 )
             written.append(
-                Written(assignment_id=assignment_id, field=column,
+                Written(assignment_id=subject, field=column,
                         wanted=value, typed=got, confirmed=""))
             continue
 
@@ -989,17 +1057,39 @@ def apply_settings(
             )
 
         found = page.evaluate(_FIELD_PROBE, field.selector)
-        if not found or not found["visible"]:
-            snapshot = save_debug_snapshot(page, f"no-{column}-{assignment_id}")
+        # **Three different failures, three different messages.** These were
+        # one line reading "no visible <label> control", and on 2026-09-10 it
+        # reported a control that was not *there* -- the peer-review id differs
+        # between the create and edit forms -- as one that was not *visible*.
+        # It sent the reader looking at what Canvas was hiding rather than at
+        # the selector, which is the opposite of an actionable error.
+        if not found:
+            snapshot = save_debug_snapshot(page, f"no-{column}-{subject}")
             raise WriteFailed(
-                f"no visible {field.label!r} control ({field.selector}) on "
-                f"{page.url}. Canvas's assignment form has changed and this "
-                f"must be re-checked before any write. Snapshot: {snapshot}"
+                f"nothing on {page.url} matches {field.selector} (the "
+                f"{field.label!r} control). Either Canvas's form has changed, "
+                f"or this control differs on this kind of form -- both need "
+                f"re-checking before any write. Snapshot: {snapshot}"
+            )
+        if found["count"] > 1:
+            snapshot = save_debug_snapshot(page, f"ambiguous-{column}-{subject}")
+            raise WriteRefused(
+                f"{field.selector} matches {found['count']} controls on "
+                f"{page.url}. Refusing rather than choosing which one the "
+                f"{field.label!r} setting means. Snapshot: {snapshot}"
+            )
+        if not found["visible"]:
+            snapshot = save_debug_snapshot(page, f"hidden-{column}-{subject}")
+            raise WriteFailed(
+                f"the {field.label!r} control ({field.selector}) is on "
+                f"{page.url} but is not visible, so anything set on it may be "
+                f"discarded on save. Canvas usually hides a control because "
+                f"another setting has not been made yet. Snapshot: {snapshot}"
             )
         # The id existing is not the same claim as the id still meaning this.
         if (found["label"].strip().lower() != field.label.lower()
                 or found["name"] != field.name):
-            snapshot = save_debug_snapshot(page, f"{column}-label-{assignment_id}")
+            snapshot = save_debug_snapshot(page, f"{column}-label-{subject}")
             raise WriteFailed(
                 f"{field.selector} on {page.url} is labelled "
                 f"{found['label']!r} (name={found['name']!r}), not "
@@ -1011,11 +1101,11 @@ def apply_settings(
             want = parse_flag(value)
             if want is None:
                 raise WriteRefused(
-                    f"assignment {assignment_id}: {field.column}={value!r} does "
+                    f"assignment {subject}: {field.column}={value!r} does "
                     f"not name a yes or a no. Refusing rather than guessing "
                     f"which way to leave a real setting."
                 )
-            _write_checkbox(page, assignment_id, field, want, found)
+            _write_checkbox(page, subject, field, want, found)
         elif field.kind == "select":
             # Validated against the page's OWN options, not only the table
             # above: Canvas could add or drop one, and `select_option` on a
@@ -1024,7 +1114,7 @@ def apply_settings(
             options = found.get("options") or ()
             if value not in options:
                 raise WriteRefused(
-                    f"assignment {assignment_id}: {field.label!r} has no option "
+                    f"assignment {subject}: {field.label!r} has no option "
                     f"{value!r}. Canvas accepts {', '.join(options)}. Note "
                     f"these are the option VALUES, not the words on screen."
                 )
@@ -1054,17 +1144,89 @@ def apply_settings(
             same = (_same_number(landed or "", value) if field.kind == "text"
                     else landed == value)
         if not same:
-            snapshot = save_debug_snapshot(page, f"{column}-reverted-{assignment_id}")
+            snapshot = save_debug_snapshot(page, f"{column}-reverted-{subject}")
             raise WriteRefused(
-                f"assignment {assignment_id}: set {field.label!r} to {value!r} "
+                f"assignment {subject}: set {field.label!r} to {value!r} "
                 f"but the form now holds {landed!r}. Nothing was saved. "
                 f"Snapshot: {snapshot}"
             )
         written.append(
-            Written(assignment_id=assignment_id, field=column,
+            Written(assignment_id=subject, field=column,
                     wanted=value, typed=landed if field.kind == "checkbox" else value,
                     confirmed="")
         )
+    return written
+
+
+def apply_settings(
+    page: Page,
+    config: Config,
+    course_id: str,
+    assignment_id: str,
+    changes: dict[str, str],
+    kind: str = "",
+) -> list[Written]:
+    """Set an assignment's non-date settings and save. **This writes.**
+
+    `changes` maps infosheet column -> wanted value. **Every field is set on
+    one form load and committed by one save**, exactly as `apply_changes` does
+    with the three dates. Saving once per field would mean two page loads, two
+    saves, and a window where the assignment holds half the edit.
+
+    Structurally identical to `apply_changes`, deliberately: the gates below
+    were each learned by being wrong on a live course, and a second write path
+    that skipped any of them would re-learn them the same expensive way.
+
+    1. the form must be genuinely ready (`FORM_READY`), never a fixed sleep;
+    2. every typed value is read back out of the DOM *before* saving;
+    3. Canvas's own field messages are read after saving.
+
+    `verify_settings` then re-reads ENV, which is the fourth and final check.
+
+    `kind` is the LIVE kind of the thing being edited (`assignment` or `quiz`)
+    and is needed only for `title`, whose control is the one field on this form
+    that differs between the two. It defaults to empty so every existing caller
+    is unaffected; a `title` change without it refuses rather than guessing.
+    """
+    _open_editor(page, config, course_id, assignment_id)
+    wait_for_form(page)
+
+    # **The override refusal carries across, and the reason is not obvious.**
+    # `points_possible` is per-assignment, so the value itself has nothing to
+    # do with any accommodation -- but saving this form submits every "Assign
+    # to" date card, so writing points to an assignment carrying overrides can
+    # still delete a student's accommodation date. Same hazard, reached from a
+    # direction that looks unrelated.
+    overrides = read_overrides(page)
+    if overrides:
+        raise WriteRefused(
+            f"assignment {assignment_id} has {overrides} override(s). Saving "
+            f"this form submits every date card, so writing its settings could "
+            f"delete a student's accommodation date. Refusing."
+        )
+
+    # **`title` does not go through `_apply_field_values`, and that is not a
+    # style choice.** That loop is keyed by infosheet column and holds exactly
+    # one control per column; title is the only field whose control depends on
+    # the KIND of thing being edited. An assignment's box is `#assignment_name`
+    # (name `name`, label `Assignment Name *`); a quiz's is `#quiz_title`
+    # (name `quiz[title]`, label `Quiz Title *`). They share nothing -- unlike
+    # the date widget, which is byte-identical on both forms, and unlike points
+    # or grading type, which do not exist on a quiz page at all.
+    #
+    # Written FIRST, so a kind mismatch refuses before any other field has been
+    # typed. Nothing is saved either way, but failing on the cheapest possible
+    # state is the habit that keeps a half-configured form from ever existing.
+    rest = dict(changes)
+    new_title = rest.pop("title", None)
+    written: list[Written] = []
+    if new_title is not None:
+        landed = _write_title(page, assignment_id, kind, new_title)
+        written.append(
+            Written(assignment_id=assignment_id, field="title",
+                    wanted=new_title, typed=landed, confirmed="")
+        )
+    written += _apply_field_values(page, assignment_id, rest)
 
     save = _save_button(page)
     if save is None:
@@ -1092,6 +1254,435 @@ def apply_settings(
     return written
 
 
+class CreateUnrecorded(Exception):
+    """An assignment was created and its id could not be captured.
+
+    **Deliberately not a `WriteFailed`.** `cmd_push_info` catches the two write
+    exceptions and moves to the next row, which is right when nothing was
+    written -- and catastrophic here: the assignment exists in Canvas, its sheet
+    row still says `NEW`, and the next push would create it a second time. This
+    must abort the run and say so.
+    """
+
+
+#: The title control. **On both forms and identical on neither** (recon
+#: 2026-09-09), which is why this is a kind-aware table rather than one entry:
+#:
+#:              assignment            quiz
+#:     id       #assignment_name      #quiz_title
+#:     name     name                  quiz[title]
+#:     label    Assignment Name *     Quiz Title *
+#:
+#: Compare the two extremes already known -- the date widget is byte-identical
+#: on both forms, and points/grading/submission do not exist on a quiz at all.
+#: Title is the case in between. Only the assignment entry is reachable today,
+#: since quiz creation is not built; the quiz entry is here because the lookup
+#: has to be kind-aware the moment it is, and a table with one row invites being
+#: written as a constant.
+TITLE_FIELDS = {
+    "assignment": FormField(column="title", selector="#assignment_name",
+                            label="Assignment Name", name="name", kind="text"),
+    "quiz": FormField(column="title", selector="#quiz_title",
+                      label="Quiz Title", name="quiz[title]", kind="text"),
+}
+
+
+def _label_matches(found: str, wanted: str) -> bool:
+    """Whether a form label is the one meant, ignoring its required marker.
+
+    Canvas renders the title label as `Assignment Name *`. An equality check
+    against `Assignment Name` refuses every write -- the same shape as the
+    `allowed_attempts` wrapping label, which reads
+    `Allowed AttemptsUnlimitedLimited` and had to be matched as a prefix.
+    """
+    return found.strip().rstrip("*").strip().lower() == wanted.strip().lower()
+
+
+def _write_title(page: Page, subject: str, kind: str, title: str) -> str:
+    """Type the assignment's title, verifying the control first.
+
+    Not routed through `_apply_field_values`: that table is keyed by infosheet
+    column and holds one control per column, and title is the first field whose
+    control **depends on the kind of thing being edited**.
+    """
+    field = TITLE_FIELDS.get(kind)
+    if field is None:
+        raise WriteRefused(
+            f"no title control is known for kind={kind!r}. Refusing rather "
+            f"than guessing which box to type a name into."
+        )
+    found = page.evaluate(_FIELD_PROBE, field.selector)
+    if not found:
+        snapshot = save_debug_snapshot(page, f"no-title-{subject}")
+        raise WriteFailed(
+            f"nothing on {page.url} matches {field.selector} (the "
+            f"{field.label!r} control). This lookup is kind-aware -- the two "
+            f"forms share nothing here -- so check that kind={kind!r} is "
+            f"right for this page. Snapshot: {snapshot}"
+        )
+    if not found["visible"]:
+        snapshot = save_debug_snapshot(page, f"hidden-title-{subject}")
+        raise WriteFailed(
+            f"the {field.label!r} control ({field.selector}) is on {page.url} "
+            f"but is not visible. Snapshot: {snapshot}"
+        )
+    # The id existing and the id still meaning this are different claims.
+    if not _label_matches(found["label"], field.label) or found["name"] != field.name:
+        snapshot = save_debug_snapshot(page, f"title-label-{subject}")
+        raise WriteFailed(
+            f"{field.selector} on {page.url} is labelled {found['label']!r} "
+            f"(name={found['name']!r}), not {field.label!r}. Refusing to type "
+            f"a title into a control that may no longer be the one meant. "
+            f"Snapshot: {snapshot}"
+        )
+
+    box = page.locator(field.selector)
+    box.click()
+    box.fill("")
+    box.type(title, delay=25)
+    # **Enter is never pressed on this form**, here as everywhere: it submits
+    # rather than committing the field.
+    box.evaluate("element => element.blur()")
+    page.wait_for_timeout(150)
+
+    # **This read-back is also what enforces the form's own length limit**, and
+    # deliberately so. Only the quiz form declares one (`maxlength=254`), so a
+    # length pre-check at diff time would have to invent a limit for
+    # assignments and would refuse a legal write -- the same reasoning that
+    # leaves term bounds unchecked. The browser truncates an over-long value at
+    # the attribute, so the box then holds something other than what was asked
+    # for and this refuses, naming both. No separate check, and nothing
+    # guessed: the form's own declaration is the authority.
+    landed = (page.evaluate(_FIELD_PROBE, field.selector) or {}).get("value")
+    if landed != title:
+        snapshot = save_debug_snapshot(page, f"title-reverted-{subject}")
+        raise WriteRefused(
+            f"set {field.label!r} to {title!r} but the form now holds "
+            f"{landed!r}. Nothing was saved. Snapshot: {snapshot}"
+        )
+    # Returned so a caller can record what the DOM actually held rather than
+    # what it asked for, as every other field's `Written` record does.
+    return landed
+
+
+#: The assignment-group `<select>`, which **carries its own name->id map**
+#: (recon 2026-09-10): every option is `value=<group id>`, `text=<group name>`.
+#: That is what makes `assignment_group` writable on a create at all -- the
+#: sheet carries the NAME and Canvas wants the ID, the same value-vs-label trap
+#: as `grading_type`, and here the page hands over the translation.
+#:
+#: Located by `name`, not by a constructed id: the name is what the recon
+#: recorded, and the options are cross-checked for being numeric so a select
+#: that merely shares the name cannot be typed into.
+_GROUP_PROBE = """() => {
+    const select = document.querySelector('select[name="assignment_group_id"]');
+    if (!select) return null;
+    const label = select.id
+        ? document.querySelector(`label[for="${CSS.escape(select.id)}"]`) : null;
+    const wrap = select.closest('label');
+    return {
+        label: ((label ? label.textContent : (wrap ? wrap.textContent : '')) || '').trim(),
+        visible: !!(select.offsetParent),
+        options: Array.from(select.options).map(o => ({
+            value: o.value, text: (o.textContent || '').trim()})),
+    };
+}"""
+
+#: The `[ Create Group ]` option. Selecting it would make a group as a
+#: side-effect of creating an assignment -- a decision to take deliberately,
+#: not to discover, so a sheet naming an unknown group is refused instead.
+CREATE_GROUP_OPTION = "new"
+
+
+def _write_group(page: Page, subject: str, name: str) -> None:
+    """Put the new assignment in a named group, resolving the name on the page."""
+    found = page.evaluate(_GROUP_PROBE)
+    if not found or not found["visible"]:
+        snapshot = save_debug_snapshot(page, f"no-group-{subject}")
+        raise WriteFailed(
+            f"no visible assignment-group control on {page.url}. Canvas's "
+            f"create form has changed and this must be re-checked before any "
+            f"write. Snapshot: {snapshot}"
+        )
+
+    real = [o for o in found["options"] if o["value"] != CREATE_GROUP_OPTION]
+    wanted = name.strip().casefold()
+    matches = [o for o in real if o["text"].casefold() == wanted]
+    if len(matches) > 1:
+        # Two groups with one name is Canvas's to allow and not ours to pick
+        # between -- the same rule as the ambiguous Save button.
+        raise WriteRefused(
+            f"assignment_group={name!r} matches {len(matches)} groups in this "
+            f"course. Refusing rather than choosing; rename one in Canvas."
+        )
+    if not matches:
+        raise WriteRefused(
+            f"assignment_group={name!r} is not a group in this course. "
+            f"Canvas has: {', '.join(o['text'] for o in real) or '(none)'}. "
+            f"Create the group in Canvas first -- this build will not make one "
+            f"as a side effect of creating an assignment."
+        )
+
+    page.locator('select[name="assignment_group_id"]').select_option(matches[0]["value"])
+    page.wait_for_timeout(150)
+    after = page.evaluate(_GROUP_PROBE)
+    chosen = next((o for o in (after or {}).get("options", [])
+                   if o["value"] == matches[0]["value"]), None)
+    if chosen is None:
+        raise WriteRefused(
+            f"the assignment-group control lost the option for {name!r} after "
+            f"it was chosen. Nothing was saved."
+        )
+
+
+#: Where Canvas lands after it accepts a new assignment: the assignment's own
+#: page, which is the only place the id it just minted appears.
+_CREATED_PATH = re.compile(r"/assignments/(?P<id>\d+)")
+
+
+def create_assignment(
+    page: Page,
+    config: Config,
+    course_id: str,
+    kind: str,
+    title: str,
+    values: dict[str, str],
+    publish: bool = False,
+) -> tuple[str, list[Written], dict[str, str]]:
+    """Create one assignment. Returns `(new id, what was set, what was inherited)`.
+
+    **This writes.**
+
+    `publish` is not in `values` because it is not a control on the form: it
+    decides whether the form is submitted with "Save" or with "Save & Publish".
+    Defaults to False, so an omitted column creates an assignment students
+    cannot see -- the recoverable direction, since publishing later is a click
+    and unpublishing something students have already seen is not.
+
+    **The first operation here that is not an edit**, and the first that is not
+    idempotent -- which is why the caller must record the returned id in the
+    sheet before doing anything else. See `infosheet.claim_new_row`.
+
+    The same discipline as the two edit paths, because each gate was learned by
+    being wrong on a live course: the form must be genuinely ready, every value
+    is read back out of the DOM before saving, and Canvas's own field messages
+    are read after. There is **no override refusal**, and that is not an
+    oversight: a form that has never been saved has no date cards to submit, so
+    the hazard those refusals exist for does not exist yet.
+    """
+    page.goto(f"{config.base_url}/courses/{course_id}/assignments/new",
+              wait_until="domcontentloaded")
+
+    # **Canvas pre-fills this form from the LAST assignment created in this
+    # browser, and that has to be cleared or the sheet is not the source of
+    # truth.** Measured 2026-09-10: `localStorage` holds
+    # `_<user>_course_<course>_new_assignment_settings`, e.g.
+    # `{"grading_type":"percent","submission_type":"external_tool",
+    #   "points_possible":10,...}`, and the form loads from it.
+    #
+    # Proved by comparing the same session against a FRESH browser profile: it
+    # showed Canvas's real defaults (`0` / `points` / `online`) where the
+    # working profile showed a previous create's values. It is Canvas's own
+    # convenience feature -- sensible for a person making five similar
+    # assignments by hand -- and wrong here, because this tool keeps ONE
+    # long-lived profile for its session cookies, so the state persists across
+    # runs and across courses' sheets.
+    #
+    # Left alone, a `NEW` row that omits `points_possible` does not get 0: it
+    # silently gets whatever was created last. Clearing costs one reload and
+    # makes an omitted column mean exactly what the documentation says it
+    # means. Nothing a person uses is affected -- this profile is headless and
+    # lives in the state directory.
+    forgotten = page.evaluate(_FORGET_REMEMBERED, course_id)
+    if forgotten:
+        page.reload(wait_until="domcontentloaded")
+
+    # The create form is the edit form, so it has the same two-part readiness:
+    # the submit button goes live before the Assign-To date card mounts.
+    wait_for_form(page)
+
+    _write_title(page, "new", kind, title)
+    group = values.get("assignment_group")
+    if group:
+        _write_group(page, "new", group)
+
+    # `kind` chose the endpoint and `assignment_group` has its own control;
+    # everything else is an ordinary settings field on the same form.
+    rest = {c: v for c, v in values.items()
+            if c not in ("title", "kind", "assignment_group")}
+    written = _apply_field_values(page, "new", rest)
+
+    # **What the form holds for everything the sheet did NOT set.**
+    #
+    # Measured 2026-09-10, and it is not what these notes assumed: the create
+    # form arrives **pre-filled from the persistent browser profile**, not at
+    # Canvas's documented defaults. The same session against a *fresh* profile
+    # shows points `0` / `points` / `online`; against the profile this tool has
+    # been using it showed `10` / `percent` / `external_tool` -- the values a
+    # previous create left behind.
+    #
+    # So "the sheet may omit a field and Canvas will default it" is FALSE here.
+    # An omitted field takes whatever the profile last held, which is a silent
+    # wrong value on a brand-new assignment. The values are captured before the
+    # save so the caller can report them: this cannot be refused (they are
+    # legal values, and the user may well want them) and it must not be
+    # invisible.
+    inherited = _unset_field_values(page, set(rest))
+    return _finish_create(page, title, written, inherited, publish=publish)
+
+
+#: Drops Canvas's remembered "new assignment settings" for one course.
+#:
+#: Matched on the SUFFIX, not built as a whole key: the real name embeds the
+#: Canvas user id (`_386071_course_169156_new_assignment_settings`), which is
+#: not otherwise needed here and would be one more thing to read correctly.
+#: Scoped to the course being written, so another course's remembered settings
+#: are left alone -- this is Canvas's feature and only the part that would
+#: contaminate *this* create is removed.
+_FORGET_REMEMBERED = """(courseId) => {
+    const suffix = `_course_${courseId}_new_assignment_settings`;
+    const hit = Object.keys(localStorage).filter(k => k.endsWith(suffix));
+    hit.forEach(k => localStorage.removeItem(k));
+    return hit;
+}"""
+
+#: What the create form holds for the fields a `NEW` row left blank, so they can
+#: be reported rather than assumed. Keyed by infosheet column.
+_INHERITED_PROBE = """() => {
+    const v = (s) => { const e = document.querySelector(s); return e ? e.value : null; };
+    const attempts = Array.from(document.querySelectorAll('select')).filter(s => {
+        const o = Array.from(s.options).map(x => x.value).sort();
+        return o.length === 2 && o[0] === 'limited' && o[1] === 'unlimited'; });
+    return {
+        points_possible: v('#assignment_points_possible'),
+        grading_type: v('#assignment_grading_type'),
+        submission_types: v('#assignment_submission_type'),
+        allowed_attempts: attempts.length && attempts[0].value === 'unlimited'
+            ? '-1' : v('input[name="allowed_attempts"]'),
+    };
+}"""
+
+
+def _unset_field_values(page: Page, specified: set[str]) -> dict[str, str]:
+    """The form's current values for columns the sheet did not name.
+
+    Read *before* saving, so the report describes what is about to be created
+    rather than what was found afterwards -- and so a caller could refuse on it
+    later without a second page load, if that is ever wanted.
+    """
+    try:
+        holding = page.evaluate(_INHERITED_PROBE) or {}
+    except PlaywrightError:
+        return {}
+    return {column: value for column, value in holding.items()
+            if column not in specified and value not in (None, "")}
+
+
+def _finish_create(
+    page: Page, title: str, written: list[Written], inherited: dict[str, str],
+    publish: bool = False,
+) -> tuple[str, list[Written], dict[str, str]]:
+    """Save the create form, and return the new id with what was set.
+
+    **`publish` chooses the button, and that is the whole mechanism.** There is
+    no publish control on an assignment form -- the 2026-09-09 recon looked for
+    one and found zero matching inputs, selects *and* buttons -- so publishing
+    is not a field this could set. Canvas offers a second submit instead.
+    """
+
+    # Looked up BEFORE anything is clicked, so a missing publish button costs a
+    # page load and not a half-made assignment. Falling back to the plain Save
+    # would be worse than failing: it creates the assignment unpublished while
+    # reporting success, which is the "no-op that looks like a write" this
+    # project keeps meeting -- except here it leaves a real object behind, and
+    # deleting is unbuilt.
+    wanted = "Save & Publish" if publish else "Save"
+    save = _save_and_publish_button(page) if publish else _save_button(page)
+    if save is None:
+        snapshot = save_debug_snapshot(page, "no-save-button-new")
+        raise WriteFailed(
+            f"no unambiguous {wanted!r} button found on {page.url}. Nothing "
+            f"was created."
+            + (" Canvas offers 'Save & Publish' only while an assignment is "
+               "unpublished; if this course or form does not show it, create "
+               "the row with published blank and publish it in Canvas."
+               if publish else "")
+            + f" Snapshot: {snapshot}"
+        )
+    save.click()
+
+    # `/new`, not `/edit`: this form's own path. Passing the default would end
+    # the wait instantly and read a rejected create as a successful one.
+    complaints = _settle_after_save(page, on_form="/new")
+    if complaints:
+        snapshot = save_debug_snapshot(page, "create-rejected")
+        raise WriteFailed(
+            f"Canvas refused to create {title!r}: {'; '.join(complaints)}. "
+            f"Nothing was created. Snapshot: {snapshot}"
+        )
+
+    # **Still on the create form means the save did not happen.** Canvas
+    # navigates away when it accepts one, so this is a rejection whose message
+    # was not recognised -- and it must NOT fall through to `_created_id`,
+    # which would find no id and report the assignment as probably CREATED.
+    #
+    # That is exactly what happened on 2026-09-10: Canvas rejected a title-only
+    # create with "Please choose at least one submission type", the probe did
+    # not match that shape, and the run halted claiming an object existed when
+    # none did. The scariest message this tool can print, printed wrongly.
+    if urlparse(page.url).path.endswith("/new"):
+        snapshot = save_debug_snapshot(page, "create-not-accepted")
+        raise WriteFailed(
+            f"Canvas did not accept {title!r}: after saving, the browser is "
+            f"still on the create form, so nothing was created. Canvas "
+            f"rejects a save without saying why in a shape this build "
+            f"recognises -- read the snapshot to see the form's own message. "
+            f"Snapshot: {snapshot}"
+        )
+
+    # The third element is what the columns the sheet left BLANK actually
+    # ended up as. With the remembered settings cleared these are Canvas's own
+    # defaults -- but they are reported rather than assumed, because that
+    # assumption is exactly what was wrong before, and a report is also the
+    # cheapest evidence that the clearing worked.
+    return _created_id(page, title), written, inherited
+
+
+def _created_id(page: Page, title: str) -> str:
+    """The id Canvas minted, from the page it landed on.
+
+    **The one place in this codebase where failing to read something is worse
+    than the write failing.** By the time this runs the assignment exists; if
+    its id cannot be captured, the sheet row still says `NEW` and the next push
+    creates a duplicate. So both available sources are tried, and the error says
+    plainly what state Canvas is in.
+    """
+    found = _CREATED_PATH.search(urlparse(page.url).path)
+    if found:
+        return found.group("id")
+
+    # ENV is the fallback rather than the primary because a create can land on
+    # a page whose ENV has not populated yet, while the URL is settled the
+    # moment the navigation completes.
+    try:
+        from_env = page.evaluate(
+            "() => { const a = window.ENV && (window.ENV.ASSIGNMENT || window.ENV.QUIZ);"
+            " return a && a.id != null ? String(a.id) : ''; }")
+    except PlaywrightError:
+        from_env = ""
+    if from_env:
+        return from_env
+
+    snapshot = save_debug_snapshot(page, "created-id-unknown")
+    raise CreateUnrecorded(
+        f"{title!r} appears to have been CREATED in Canvas, but its new id "
+        f"could not be read from {page.url}. The sheet still says NEW for that "
+        f"row, so pushing again would create it a SECOND time. Re-run "
+        f"`canvasser pull` to get the real id before pushing this sheet again. "
+        f"Snapshot: {snapshot}"
+    )
+
+
 def verify_settings(
     page: Page, config: Config, course_id: str, assignment_id: str,
     columns: tuple[str, ...],
@@ -1109,12 +1700,27 @@ def verify_settings(
     # (live, 2026-09-09). Two implementations of "how an ENV value becomes a
     # cell" will eventually disagree, and the one on the verify path is the one
     # that decides whether a correct write is reported as a failure.
-    from .assignments import _cell
+    from .assignments import ENV_PROBE, _cell
 
     _open_editor(page, config, course_id, assignment_id)
     page.wait_for_function(SUBJECT_READY, timeout=30_000)
-    subject = page.evaluate(f"() => {_SUBJECT}")
-    return {column: _cell((subject or {}).get(column)) for column in columns}
+    # **Read through the SAME probe the sheet is built from, not off the raw
+    # ENV object**, because the two do not share every key. `title` is the one
+    # that bites: an assignment carries `ENV.ASSIGNMENT.name` and a quiz
+    # carries `ENV.QUIZ.title`, so the sheet reads it as
+    # `subject.name || subject.title` -- and asking the raw object for `title`
+    # returns nothing at all for an assignment. A correct rename would then be
+    # reported as MISMATCH against an empty string, and `cmd_push_info` would
+    # tell the user Canvas "holds '', which is neither the old nor the new
+    # value" about a write that had landed perfectly.
+    #
+    # That is the 2026-09-09 `submission_types` seam exactly -- two
+    # implementations of "how an ENV value becomes a cell", one on the read
+    # path and one on the verify path, agreeing until they did not. `_cell` was
+    # already shared for the same reason; this shares the key resolution too,
+    # so there is one implementation rather than two that must be kept level.
+    subject = page.evaluate(ENV_PROBE) or {}
+    return {column: _cell(subject.get(column)) for column in columns}
 
 
 def verify(page: Page, config: Config, course_id: str, assignment_id: str) -> dict:
@@ -1166,8 +1772,16 @@ def _open_editor(page: Page, config: Config, course_id: str, assignment_id: str)
     )
 
 
-def _settle_after_save(page: Page) -> list[str]:
+def _settle_after_save(page: Page, on_form: str = "/edit") -> list[str]:
     """Wait for the save to resolve, and return Canvas's field messages.
+
+    `on_form` is the path suffix that means *we are still on the form*. It is a
+    parameter because **the create form is at `/assignments/new`, not `/edit`**,
+    and the default would make this return instantly there: `/new` does not end
+    with `/edit`, so the wait would be satisfied before the save resolved and a
+    Canvas rejection would be read as a clean create. That is this function's
+    own bug -- a check that races the navigation -- reappearing on the one path
+    that was not written yet.
 
     **A state, never a duration.** The previous version clicked Save, waited a
     flat 2 seconds, then read `page.url` and evaluated in the page if it still
@@ -1196,7 +1810,9 @@ def _settle_after_save(page: Page) -> list[str]:
     """
     try:
         page.wait_for_function(
-            f"() => !location.pathname.endsWith('/edit') || ({_FIELD_MESSAGES})().length",
+            f"(suffix) => !location.pathname.endsWith(suffix) "
+            f"|| ({_FIELD_MESSAGES})().length",
+            arg=on_form,
             timeout=30_000,
         )
     except PlaywrightTimeout:
@@ -1204,7 +1820,10 @@ def _settle_after_save(page: Page) -> list[str]:
         # nothing. Fall through and let the checks below decide -- ENV is
         # re-read afterwards regardless, so a stall cannot pass as a success.
         pass
-    if "/edit" not in page.url:
+    # Compared on the parsed path, matching the wait above. A substring test
+    # over the whole URL would disagree with it for a query string mentioning
+    # the suffix, and the two must reach the same answer.
+    if not urlparse(page.url).path.endswith(on_form):
         return []
     try:
         return page.evaluate(_FIELD_MESSAGES)
@@ -1239,5 +1858,45 @@ def _save_button(page: Page):
         # Fall back to the accessible-name lookup, which is the one that
         # distinguished them correctly in recon.
         by_role = page.get_by_role("button", name="Save", exact=True)
+        return by_role.first if by_role.count() == 1 else None
+    return None
+
+
+def _save_and_publish_button(page: Page):
+    """The form's one visible "Save & Publish" control, or None.
+
+    **Measured, not assumed** (`archives/recon-scripts/publish_button_recon.py`,
+    2026-09-10, Temple's TEMPLATE course): a `<button class="btn btn-default
+    save_and_publish">` with **no id**, `type="button"`, sitting inside the form
+    beside the ordinary Save. Present on `/assignments/new` **and** on the edit
+    form of an assignment that is still unpublished.
+
+    That probe exists because the note claiming this button was on "the create
+    form" came from a probe of `/assignments/new?quiz_lti` -- a different page,
+    by these notes' own insistence -- and was about to be coded against the
+    plain create form. It is the `peer_reviews` mistake in its exact shape: a
+    control seen on one form, assumed on another. It happened to be true here.
+    It was still worth one page load to know rather than to hope.
+
+    **Matched on the button's text, with the class as corroboration only.** The
+    class is the more specific handle and the more brittle one -- Canvas
+    restyles -- while the words are what a person clicks and what the
+    accessible name reports. This mirrors `_save_button` deliberately: two
+    lookups on the same page that disagreed about how to find a button would be
+    two implementations of one question, which is the shape that has cost this
+    project three bugs.
+
+    **More than one match returns None rather than choosing.** Same rule as the
+    Save button, and it matters more here: picking wrong publishes something to
+    students.
+    """
+    found = page.locator("button:visible, input[type=submit]:visible").filter(
+        has_text=re.compile(r"^\s*save\s*&\s*publish\s*$", re.I)
+    )
+    count = found.count()
+    if count == 1:
+        return found.first
+    if count > 1:
+        by_role = page.get_by_role("button", name="Save & Publish", exact=True)
         return by_role.first if by_role.count() == 1 else None
     return None
