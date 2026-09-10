@@ -36,7 +36,7 @@ A round trip: **pull to CSV, edit in a spreadsheet, push it back.**
 canvasser status                      # is the stored session still authenticated?
 canvasser login                       # authenticate (GatorLink + Duo)
 canvasser courses                     # list courses, with ids
-canvasser settings 580777             # course details, sections, navigation
+canvasser settings 580777             # all five displays; narrow with --sections etc.
 canvasser pull 580777                 # dates AND settings -> two CSVs
 canvasser pull 580777 --dates         # just dates-580777.csv
 canvasser pull 580777 --info          # just info-580777.csv
