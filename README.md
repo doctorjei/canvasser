@@ -18,8 +18,10 @@ automation is the better-supported path for this institution.
 >
 > **Assignment settings** — points, grading type, submission types, allowed attempts, peer
 > review, publish state — are pulled to a second CSV. Writing them is newer than the date
-> path: everything but publish state can be written. Anything not yet writable is reported
-> rather than silently ignored.
+> path: points, grading type, submission types, allowed attempts and peer review can be
+> written. **Publish state cannot**, and a changed title is reported as needing a `--rename`
+> flag that does not exist yet. Anything not writable is reported rather than silently
+> ignored.
 >
 > **Not supported:** assignments with per-student or per-section overrides. Saving Canvas's
 > edit form submits *every* date card, so getting that wrong deletes an accommodation date.
