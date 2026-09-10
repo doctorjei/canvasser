@@ -16,6 +16,12 @@ cookies*.json
 __pycache__/
 *.py[cod]
 
+# Editor swap files. A sheet open in vim leaves `.dates-<course>.csv.swp` beside
+# it, and the leading dot means `*.csv` above does not match it.
+*.swp
+*.swo
+*~
+
 # Build artifacts. Never commit these: a stale wheel in the tree is the easiest
 # way to publish a version that does not match the source it claims to be.
 dist/
