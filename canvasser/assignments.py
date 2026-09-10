@@ -27,6 +27,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime
+from typing import NamedTuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout
@@ -118,9 +119,24 @@ class Assignment:
     url: str
 
 
+class ListSettle(NamedTuple):
+    """How many links were seen, and whether the list had stopped moving.
+
+    **The `settled` flag is the whole point.** This used to be a bare `int`, so
+    "the list settled at 37" and "we gave up at 20s and 37 was merely the last
+    number seen" were the same value of the same type, distinguishable by
+    nothing at all. The caller could not have checked even if it had tried --
+    and it did not try, which is how a partially-rendered index became a CSV
+    that looked complete.
+    """
+
+    count: int
+    settled: bool
+
+
 def _wait_for_list_to_settle(
     page: Page, quiet_polls: int = 3, interval_ms: int = 500, timeout_ms: int = 20_000
-) -> int:
+) -> ListSettle:
     """Wait until the assignment list stops growing.
 
     The index renders rows asynchronously, so reading it too early silently
@@ -131,6 +147,10 @@ def _wait_for_list_to_settle(
     `quiesce` (network idle) is not sufficient on its own here; we watch the
     thing we actually care about -- the link count -- and require it to hold
     steady across several polls before trusting it.
+
+    **Returns whether it settled, and the caller must act on that.** Timing out
+    is not a soft outcome here: it means the page was still growing when we
+    stopped looking, so whatever is scraped next is a subset of unknown size.
     """
     selector = "a[href*='/assignments/'], a[href*='/quizzes/']"
     waited = 0
@@ -142,14 +162,19 @@ def _wait_for_list_to_settle(
         if count == last and count > 0:
             stable += 1
             if stable >= quiet_polls:
-                return count
+                return ListSettle(count=count, settled=True)
         else:
             stable = 0
         last = count
         page.wait_for_timeout(interval_ms)
         waited += interval_ms
 
-    return last
+    # Never reached on an empty course *quietly*: stability requires `count > 0`,
+    # so a course with no assignments burns the full timeout and arrives here
+    # with `last == 0`. The caller refuses either way, and `list_assignments`'
+    # own "no assignments found" guard would catch it next -- but arriving here
+    # is the honest report, because we genuinely never saw the list stop.
+    return ListSettle(count=max(last, 0), settled=False)
 
 
 def list_assignments(page: Page, config: Config, course_id: str) -> list[Assignment]:
@@ -163,8 +188,37 @@ def list_assignments(page: Page, config: Config, course_id: str) -> list[Assignm
         wait_until="domcontentloaded",
     )
     quiesce(page)
-    _wait_for_list_to_settle(page)
 
+    # **Refuse a list still in motion; never scrape one.** Discarding this
+    # return value was a real bug: a course whose index had not finished
+    # rendering at the timeout was scraped partially, and because `found` came
+    # back non-empty the "no assignments" guard below never fired. The result
+    # was a short CSV that looks exactly like a complete one -- and a full
+    # `pull` overwrites the existing sheet without asking, so the complete
+    # version is gone and nothing reports a loss. `push` then reads only the
+    # ids its sheet names, so the dropped assignments stay invisible from then
+    # on, silently keeping last semester's dates.
+    seen = _wait_for_list_to_settle(page)
+    if not seen.settled:
+        snapshot = save_debug_snapshot(page, f"assignments-unsettled-{course_id}")
+        raise RuntimeError(
+            f"The assignments index for course {course_id} was still rendering "
+            f"when the wait timed out ({seen.count} link(s) found and still "
+            f"changing). Refusing to scrape a list in motion: the rows that had "
+            f"not appeared yet would be missing from the sheet, and a sheet "
+            f"short by an unknown number of rows looks exactly like a complete "
+            f"one. Re-run the pull; if it keeps happening the course index is "
+            f"genuinely slow rather than broken. Snapshot: {snapshot}"
+        )
+
+    # **Do NOT "harden" this by checking `seen.count` against `len(found)`.**
+    # They are different quantities by design and are legitimately unequal on a
+    # perfectly healthy page: the selector matches every anchor containing
+    # `/assignments/` or `/quizzes/` (a row's title, its cog menu, its
+    # SpeedGrader link), ids are deduplicated below, and titleless links are
+    # skipped. `len(found)` is therefore normally well under `seen.count`, and
+    # an equality check would report a good pull as broken. The settle flag is
+    # the signal; the counts are not comparable.
     links = page.locator("a[href*='/assignments/'], a[href*='/quizzes/']")
     found: dict[str, Assignment] = {}
 
