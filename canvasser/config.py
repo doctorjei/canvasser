@@ -250,6 +250,11 @@ class Config:
     #: The SSO entry path for THIS institution. `None` means "not configured",
     #: which is only usable at UF -- see `sso_url`.
     sso_path: str | None = None
+    #: Authenticate with the IdP's authenticator app as the PRIMARY credential,
+    #: with no password at all. Carried on the config because `auth` needs it
+    #: at the credential picker, and because it changes what
+    #: `resolve_credentials` is even allowed to demand.
+    passwordless: bool = False
     #: Saved cookies for THIS institution. Carried on the config rather than
     #: read from a module constant, because two institutions' sessions must not
     #: land in one file -- logging in to the second would silently destroy the
@@ -289,6 +294,7 @@ def load_config(
     secrets_file: Path | None = None,
     allow_prompt: bool = True,
     institution: str | None = None,
+    passwordless: bool = False,
 ) -> Config:
     """Resolve credentials from every supported source, by precedence.
 
@@ -313,6 +319,7 @@ def load_config(
         secrets_file=secrets_file,
         default_file=env_file,
         allow_prompt=allow_prompt,
+        require_password=not passwordless,
     )
 
     # Neither of these is a secret, so resolution stays simple: explicit
@@ -350,6 +357,7 @@ def load_config(
         profile_dir=paths.profile_dir,
         session_state_file=paths.session_state_file,
         sso_path=setting(SSO_PATH_VAR),
+        passwordless=passwordless,
         credential_sources=(
             f"username from {resolved_user.source}, "
             f"password from {resolved_pass.source}"

@@ -19,7 +19,7 @@ from typing import Protocol
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout
 
 from .browser import save_debug_snapshot
-from .progress import duo_box, glyphs_for
+from .progress import duo_box, glyphs_for, print_box
 
 DUO_HOST_FRAGMENT = "duosecurity.com"
 
@@ -111,9 +111,7 @@ def announce_number(number: str | None) -> None:
     """
     global _announced
     _announced = True
-    box = duo_box(number, glyphs_for(sys.stderr))
-    print("\n" + "\n".join(f"             {line}" for line in box) + "\n",
-          file=sys.stderr, flush=True)
+    print_box(duo_box(number, glyphs_for(sys.stderr)), sys.stderr)
 
 
 def _wait_for_duo_to_clear(page: Page, timeout_ms: int, watch_number: bool = False) -> None:

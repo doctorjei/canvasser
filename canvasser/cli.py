@@ -1,7 +1,7 @@
 """Command-line entry point.
 
     canvasser status               # is the stored session still authenticated?
-    canvasser login                # authenticate (prompts Duo if needed)
+    canvasser login                # authenticate; asks for whatever the IdP wants
     canvasser courses --teaching   # list courses with their ids
     canvasser settings <course>    # details, sections, navigation
     canvasser pull <course>        # dates AND settings -> two CSVs
@@ -18,6 +18,16 @@ Credentials come from the first source that has them: --secrets-file, the
 environment, the default secrets file, then a prompt. There is no password flag
 -- argv is not private -- so use a file, an env var, or sshpass for scripted
 runs. Run with -v to see which source was used (never the value itself).
+
+**Global flags come BEFORE the subcommand** -- `--institution`, `--factor`,
+`--passwordless`, `--no-prompt`, `--username`, `--secrets-file`, `--headed`,
+`-v`. `canvasser --factor passcode login` is right; `canvasser login --factor
+passcode` is a usage error, and was documented the wrong way round until
+2026-09-11.
+
+Some identity providers want no password at all (an authenticator app as the
+primary credential). `--passwordless` asks for that where it is offered, and
+then CANVAS_PASSWORD is not needed or read.
 """
 
 from __future__ import annotations
@@ -120,6 +130,7 @@ def config_from_args(args: argparse.Namespace) -> "Config":
         username=args.username,
         secrets_file=Path(args.secrets_file) if args.secrets_file else None,
         allow_prompt=not args.no_prompt,
+        passwordless=args.passwordless,
         institution=getattr(args, "institution", None),
     )
     if args.verbose:
@@ -1112,10 +1123,19 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--passwordless",
+        action="store_true",
+        help="Sign in with your authenticator app as the primary credential, "
+             "with no password at all. Needs an identity provider that offers "
+             "it (Microsoft Entra does); CANVAS_PASSWORD is then unnecessary.",
+    )
+    parser.add_argument(
         "--factor",
         choices=sorted(APPROVERS),
         default="push",
-        help="Duo second factor to use when a login is needed (default: push)",
+        help="Second factor to use when a login is needed: 'push' approves on "
+             "your phone, 'passcode' prompts for a code you read from the app "
+             "(default: push). Applies to Duo and to Microsoft Authenticator.",
     )
     parser.add_argument(
         "--headed",

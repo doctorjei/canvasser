@@ -1,8 +1,11 @@
 # canvasser
 
 Automation for Canvas (`*.instructure.com`) that **navigates the site as a person would**,
-rather than through the REST API. Built against UF; other institutions need one setting
-(see [Scope](#scope-official-instructure-hosts-only)).
+rather than through the REST API. Built against UF and running at three institutions; most
+need only one setting, an SSO path (see
+[Scope](#scope-official-instructure-hosts-only)). A provider whose sign-in form differs
+needs a row in `auth.IDPS` as well — there are two such rows today, Shibboleth and
+Microsoft Entra ID.
 
 That choice is deliberate. UF [discontinued API token
 support](https://elearning.ufl.edu/instructor-help/api-tokens/) after Instructure began
@@ -40,7 +43,8 @@ A round trip: **pull to CSV, edit in a spreadsheet, push it back.**
 
 ```bash
 canvasser status                      # is the stored session still authenticated?
-canvasser login                       # authenticate (GatorLink + Duo)
+canvasser login                       # authenticate (SSO, plus a second factor if your
+                                      #   institution uses one)
 canvasser courses                     # list courses, with ids
 canvasser settings 580777             # all five displays; narrow with --sections etc.
 canvasser pull 580777                 # dates AND settings -> two CSVs
@@ -49,8 +53,10 @@ canvasser pull 580777 --info          # just info-580777.csv
 canvasser push dates-580777.csv       # show what would change; writes nothing
 canvasser push dates-580777.csv --commit   # actually write it
 canvasser push info-580777.csv --commit    # settings, and any NEW rows
+canvasser push info-580777.csv --rename    # also allow title changes (still needs --commit)
 canvasser install-browser             # fetch Chromium up front (usually automatic)
 canvasser --institution templeu status     # a different Canvas, with its own session
+canvasser --institution ucf --passwordless login   # no password: approve in your app
 ```
 
 `push` previews by default. Running it repeatedly while editing a sheet cannot touch the
@@ -72,8 +78,22 @@ ASCII drawing on a terminal that cannot render box characters.
 ## Requirements
 
 - Python 3.10+ (developed and tested on 3.13)
-- A Canvas account at an `*.instructure.com` institution (developed against
-  UF GatorLink with Duo MFA)
+- A Canvas account at an `*.instructure.com` institution. **Verified against a live login
+  at three:** UF (Shibboleth SSO with Duo MFA), Temple (Shibboleth, no second factor), and
+  UCF (**Microsoft Entra ID**, passwordless — approve in Microsoft Authenticator).
+  Each institution needs an SSO path, which has no safe default and must be configured;
+  beyond that, the only institution-specific code is a row in `auth.IDPS` naming the
+  identity provider's form. Vanity domains are not supported — UCF's Canvas must be
+  reached as `ucf.instructure.com`, not `webcourses.ucf.edu`.
+
+  **Sign-in adapts to what the provider asks for.** Entra tenants often default to a
+  passkey, which this tool cannot answer (the credential lives in hardware); it declines
+  truthfully and takes whatever else is offered — a password, or an authenticator app.
+  Whether a password is wanted at all is the provider's decision, not a setting here.
+  Use `--passwordless` to prefer the app even when a password *is* on offer, and
+  `--factor passcode` to type a code instead of approving a push.
+  One-time codes are always prompted for, never stored: automating them from a stored seed
+  would put both factors in one file.
 - No display required — runs headless
 
 ## Install
@@ -155,20 +175,38 @@ sshpass -f ~/.canvas-pw canvasser --username jjb pull 580777
 ```
 
 Prompts read `/dev/tty`, not stdin, so this works even when stdin is a pipe. `--no-prompt`
-disables prompting entirely for unattended use; `-v` reports which source each value came
-from, never the value itself.
+disables prompting entirely for unattended use; `-v` (or `--verbose`) reports which source
+each value came from, never the value itself.
 
-### Duo
+**`--headed` runs the browser visibly** instead of headless, on a machine with a display.
+It is the escape hatch for a sign-in canvasser cannot complete on its own — a hardware
+security key, or a passkey that needs a QR scanned from the browser's own dialog. Finish it
+by hand in that window and the session is saved exactly as it would be otherwise.
 
-`login` sends a **Duo push to your phone** — have it in hand. Duo's Verified Push shows a
-number that must be tapped; canvasser prints it and re-reads it every 5 seconds in case the
-push is re-sent. `--factor passcode` reads a 6-digit code instead.
+### Second factors
 
-> If you receive a Duo push you were not expecting, **deny it.**
+**Have your phone in hand when you run `login`.** What you are asked for depends on the
+institution, and canvasser prints whatever the page shows so you can act on it — the number
+to match exists only inside a headless browser otherwise. It is **framed in a box** at both
+providers, because it arrives in a window of about a minute and a line of ordinary text is
+easy to scroll past. If the number cannot be read off the page, the box still appears with
+the instruction, and the page's own words are printed below it.
 
-Your MFA stays intact: the stored password is *something you know*, the phone is *something
-you have*. No TOTP seed is stored anywhere. Once Duo remembers the device (~10 hours), runs
-need no interaction at all.
+| | what appears | |
+|---|---|---|
+| Duo (e.g. UF) | a number to tap in the Duo app | re-read every 5s in case the push is re-sent |
+| Microsoft Authenticator (e.g. UCF) | a number to match in the app | the page polls until you approve |
+| none (e.g. Temple) | nothing | the login simply completes |
+
+`--factor passcode` types a 6-digit code instead of approving a push — it works for Duo and
+for Microsoft Authenticator.
+
+> If you receive a push you were not expecting, **deny it.**
+
+Your MFA stays intact: a stored password is *something you know*, the phone is *something
+you have*. **No TOTP seed is ever stored** — one-time codes are prompted for and forgotten,
+because keeping the seed beside the password would put both factors in one file. Once the
+provider remembers the device (Duo: ~10 hours), runs need no interaction at all.
 
 ## Selecting a course
 

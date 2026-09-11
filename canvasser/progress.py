@@ -197,19 +197,51 @@ def _box(lines: list[str], width: int, corners) -> list[str]:
     return out
 
 
-def duo_box(code: str | None, glyphs: Glyphs = UNICODE) -> list[str]:
-    """Duo's Verified Push number, or the instruction when there is none.
+#: How far a box is indented when printed. Duo's, adopted as the shared value
+#: so a second provider's prompt lines up with the first rather than merely
+#: looking similar.
+BOX_INDENT = " " * 13
 
-    Absence is normal, not an error: `read_verification_number` returns None
-    when the tenant has Verified Push switched off, and a plain approve tap is
-    then all that is needed. The frame stays either way so the screen keeps its
-    shape; only its contents change.
+
+def print_box(lines: list[str], stream=None) -> None:
+    """Put a box on the screen, blank line above and below.
+
+    **To stderr by default, as Duo's always has been** -- this is a prompt to a
+    human, not part of any output being captured. One implementation so two
+    providers cannot drift apart on the indent.
+    """
+    stream = stream if stream is not None else sys.stderr
+    print("\n" + "\n".join(BOX_INDENT + line for line in lines) + "\n",
+          file=stream, flush=True)
+
+
+def code_box(code: str | None, *, heading: str, instruction: str,
+             glyphs: Glyphs = UNICODE) -> list[str]:
+    """A number a human must match, framed so it cannot be missed.
+
+    **Generalised from `duo_box` because a second provider needed the same
+    thing** (2026-09-11). Duo and Microsoft Entra ID ask the identical question
+    -- here is a number, tap it on your phone -- and the number exists only on a
+    page in a headless browser nobody can see. Entra's arrived as one
+    unremarkable line among nine, at exactly the moment it matters: a ~60s
+    window, on someone else's account.
+
+    **Absence is normal, not an error, at both providers**: Duo returns no
+    number when the tenant has Verified Push switched off, and at Entra the
+    number may simply not have been found. The frame is drawn either way so the
+    screen keeps its shape, and so that the *prompt* is unmissable even when the
+    number is not in hand -- which is the half that does not depend on getting
+    any selector right.
+
+    `heading` and `instruction` are the caller's, because the words name the app
+    the human has to open and there is no generic phrasing for that. Keep both
+    inside `DUO_W`; nothing here wraps.
     """
     # Centred over the frame, but NOT padded out to it: this line has no
     # right-hand edge to meet, and a trailing space is just invisible litter.
-    head = _centre("Duo App: Please Authenticate Now", DUO_W + 2).rstrip()
+    head = _centre(heading, DUO_W + 2).rstrip()
     if code is None:
-        body = [f"{glyphs.star_l} Open Duo and Approve {glyphs.star_r}"]
+        body = [f"{glyphs.star_l} {instruction} {glyphs.star_r}"]
         return [head] + _box(body, DUO_W, glyphs.heavy)
 
     spaced = " ".join(code)
@@ -218,6 +250,18 @@ def duo_box(code: str | None, glyphs: Glyphs = UNICODE) -> list[str]:
     vert = glyphs.light_box[5]
     body = ["CODE:", inner[0], vert + cell + vert, inner[-1]]
     return [head] + _box(body, DUO_W, glyphs.heavy)
+
+
+def duo_box(code: str | None, glyphs: Glyphs = UNICODE) -> list[str]:
+    """Duo's Verified Push number, or the instruction when there is none.
+
+    **Kept as its own name, and its output must not move.** The user's original
+    mock is the fixture `progress_check.py` asserts against, so this is a
+    wrapper over `code_box` rather than a rewrite: the words are Duo's, the
+    frame is shared.
+    """
+    return code_box(code, heading="Duo App: Please Authenticate Now",
+                    instruction="Open Duo and Approve", glyphs=glyphs)
 
 
 def stat_box(rows: list[tuple[str, int]], glyphs: Glyphs = UNICODE) -> list[str]:

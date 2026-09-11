@@ -30,6 +30,14 @@ Two details here exist to keep that working and must not be "tidied" away:
 The username must come from somewhere else under sshpass -- it answers only the
 password prompt, so a username prompt would hang waiting for input that never
 arrives. Use --username, a secrets file, or the environment.
+
+**A password is not always needed.** Some identity providers treat an
+authenticator app as the *primary* credential, so `--passwordless` sets
+`require_password=False` here and the password is neither read nor prompted for
+-- `resolve_credentials` reports its source as "not needed (passwordless)".
+That is a flag in the CLI changing a requirement two layers down, which is a
+seam worth knowing about: see `workbook/designs/auth-factors.md` in the
+project's own notes.
 """
 
 from __future__ import annotations
@@ -188,8 +196,15 @@ def resolve_credentials(
     secrets_file: Path | None = None,
     default_file: Path,
     allow_prompt: bool = True,
+    require_password: bool = True,
 ) -> tuple[Resolved, Resolved]:
-    """Resolve (username, password), each independently, by precedence."""
+    """Resolve (username, password), each independently, by precedence.
+
+    `require_password=False` is for **passwordless sign-in**, where the
+    identity provider treats an authenticator app as the primary credential.
+    There is then no password to resolve, and demanding one would refuse a
+    login that needs no secret at rest -- which is the whole point of it.
+    """
     explicit_values: dict[str, str] = {}
     if secrets_file is not None:
         # Distinguish "wrong path" from "not a readable file" -- a typo'd path
@@ -237,5 +252,7 @@ def resolve_credentials(
 
     return (
         resolve("username", USERNAME_VARS, username, secret=False),
-        resolve("password", PASSWORD_VARS, None, secret=True),
+        resolve("password", PASSWORD_VARS, None, secret=True)
+        if require_password
+        else Resolved("", "not needed (passwordless)"),
     )
