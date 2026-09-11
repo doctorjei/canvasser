@@ -24,24 +24,33 @@ from the page's own controls, refusing when two match or none does.
 same Entra method picker is a *primary credential* when the account is
 remembered and a *second factor* after a password, so nothing here labels steps
 by position. What is asked for depends on the tenant, the account, and the
-profile's own history:
+profile's own history.
 
-    username box       -> type the username        (absent if already known)
-    credential picker  -> choose password, or the app with --passwordless
-    password box       -> type the password        (absent if none is wanted)
-    method picker      -> choose a factor by authMethodId
-    code box           -> prompt the human; never stored
+`log_in` is therefore a **recogniser loop**: a set of page states, each with a
+detector and an answer, dispatched against whatever is on screen until we are
+authenticated or nothing matches.
 
-**Whether a password is asked for at all is the provider's decision**, not the
-caller's, so the ordinary path proceeds happily when none is offered.
-A fuller treatment, including the loop this should eventually become, is in
+    a username                  -> type it                (absent if known)
+    which credential to use     -> password, or the app with --passwordless
+    a password                  -> type it       (absent if none is wanted)
+    which verification method   -> choose by authMethodId
+    an authenticator code       -> prompt the human; never stored
+    a Duo challenge             -> hand to the approver
+
+**No state knows its index**, so three factors, one, or none is one code path,
+and a provider that inserts a screen tomorrow needs a row in `RECOGNISERS`
+rather than a re-plumbing. **Whether a password is asked for at all is the
+provider's decision**, not the caller's, so the ordinary path proceeds happily
+when none is offered. The derivation is in
 `workbook/designs/auth-factors.md` in the project's own notes.
 """
 
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import NoReturn
 
 from playwright.sync_api import (Error as PlaywrightError, Page,
                                  TimeoutError as PlaywrightTimeout)
@@ -76,7 +85,8 @@ class IdP:
     password_field: str
     submit: str
     #: Whether the username is submitted **on its own**, before the password
-    #: box becomes usable. The difference is not cosmetic: see `_submit_entra`.
+    #: box becomes usable. Not cosmetic: it decides whether a username box and
+    #: a password box are one state or two.
     two_screen: bool
     #: Every selector that identifies this family, not just its username box.
     #: **An IdP that remembers the account never shows a username field at
@@ -271,26 +281,6 @@ def detect_idp(page: Page, timeout_ms: int = 30_000) -> IdP:
     return matched[0]
 
 
-def _submit_credentials(page: Page, config: Config,
-                        prefer: str = "push") -> IdP:
-    """Fill and submit whichever credential form this IdP presents.
-
-    Returns the family, so the rejection check that follows tests the right
-    control rather than re-deriving it from a page that may by then have moved
-    on.
-
-    Shibboleth's form action carries a stateful `execution=e1sN` token that
-    increments per step, so we always submit the form **as rendered** rather
-    than posting anywhere we constructed ourselves. That rule holds for any
-    family here; none of them is ever posted to directly.
-    """
-    idp = detect_idp(page)
-    if idp.two_screen:
-        _submit_entra(page, config, idp, prefer=prefer)
-    else:
-        _submit_single_screen(page, config, idp)
-    return idp
-
 
 def _submit_single_screen(page: Page, config: Config, idp: IdP) -> None:
     """Both fields and one click -- Shibboleth, and proven live at UF and Temple."""
@@ -413,89 +403,6 @@ def _entra_stall_reason(page: Page, idp: IdP) -> str:
             f"factor. Check the snapshot before changing {USERNAME_VAR}.")
 
 
-def _submit_entra(page: Page, config: Config, idp: IdP,
-                  timeout_ms: int = 30_000, prefer: str = "push") -> None:
-    """Username, then Next, then the password on the screen that follows.
-
-    **A selector swap alone would not have worked here, and would not have said
-    so.** Entra ships both views as markup and hides the inactive one, so the
-    single-screen path would have filled an `opacity: 0` password box --
-    `fill` *succeeds* on one -- clicked a button labelled "Next", and submitted
-    the username by itself. No exception, no typo, just a login that quietly
-    never sent a password.
-
-    So the password is typed only once its box is genuinely operable, and that
-    is **waited for as a state, never a duration**: the view switch is
-    client-side, which is precisely where a fixed settle races.
-    """
-    if page.evaluate(OPERABLE_PASSWORD, [idp.username_field]):
-        page.fill(idp.username_field, config.username)
-        page.click(idp.submit)
-    else:
-        # **The IdP already knows who we are.** A warm profile skips the
-        # username screen entirely and opens on the credential challenge, so
-        # typing a name here would find no box and reaching for one would
-        # report a login problem that does not exist.
-        _log("The identity provider already has this account; no username "
-             "needed.")
-
-    if config.passwordless:
-        # **The app IS the credential here, so there is no password step at
-        # all.** The tenant's default is a passkey, which this process cannot
-        # answer, so the picker still has to be opened -- but what gets chosen
-        # is the authenticator, and nothing is typed afterwards.
-        if _choose_primary_method(page, ENTRA_APP_TILE, ENTRA_APP_WORDS):
-            return
-        # **A remembered account skips the primary picker entirely** and opens
-        # straight on "Verify your identity" -- the method tiles, keyed by
-        # `authMethodId`. Measured 2026-09-11. Nothing to choose here: the
-        # caller's factor step picks from exactly this list, so selecting it
-        # twice would be two implementations of one decision.
-        if _entra_factor_offered(page):
-            _log("The identity provider is asking which method to verify "
-                 "with; choosing there.")
-            return
-        snapshot = save_debug_snapshot(page, "login-no-passwordless")
-        raise LoginError(
-            f"Passwordless sign-in was asked for, but this account was not "
-            f"offered an authenticator app as a primary credential "
-            f"(url={page.url}). Drop --passwordless to use the stored "
-            f"password instead. Snapshot: {snapshot}")
-
-    try:
-        _wait_for_password_box(page, idp, timeout_ms)
-    except PlaywrightTimeout:
-        # **"No password box" is not the end of the road.** A tenant whose
-        # default method is a passkey shows that first; the password lives
-        # behind "Sign in another way". Discovered only by going one screen
-        # further -- the whole UCF flow was called impossible on the strength
-        # of the first screen it happened to render.
-        if not _choose_password_method(page):
-            # **The provider may simply not want a password.** A remembered
-            # account is taken straight to "Verify your identity", whose tiles
-            # are verification methods and include none. That is not a failure
-            # and must not need a flag to survive: whether a password is asked
-            # for is the IdP's decision, not the caller's. The factor step
-            # picks from those tiles exactly as it would after a password.
-            if _entra_factor_offered(page):
-                _log("This provider is not asking for a password; verifying "
-                     "with an authenticator method instead.")
-                return
-            _raise_entra_stall(page, idp)
-        try:
-            _wait_for_password_box(page, idp, timeout_ms)
-        except PlaywrightTimeout:
-            _raise_entra_stall(page, idp)
-
-    page.fill(idp.password_field, config.password)
-    page.click(idp.submit)
-    page.wait_for_load_state("domcontentloaded")
-
-
-def _wait_for_password_box(page: Page, idp: IdP, timeout_ms: int) -> None:
-    """Block until a password box a person could type into is on screen."""
-    page.wait_for_function(OPERABLE_PASSWORD, arg=[idp.password_field],
-                           timeout=timeout_ms)
 
 
 def _choose_password_method(page: Page) -> bool:
@@ -655,12 +562,27 @@ def _check_for_credential_rejection(
 
 
 def log_in(page: Page, config: Config, approver: Approver | None = None) -> None:
-    """Perform a full SSO login: credentials, then the Duo second factor."""
+    """Perform a full SSO login, whatever the provider decides to ask for.
+
+    **A recogniser loop, not a sequence** (user's design, 2026-09-11). The
+    question at every step is *"is anything being asked, and can we answer
+    it?"* -- never *"what comes third?"*. See `workbook/designs/auth-factors.md`.
+
+    The evidence that ordering is the wrong concept: **Entra's method picker is
+    a primary credential on one path and a second factor on another.** It
+    appears after a password, where it is unambiguously a second factor, and
+    *instead of* a password when the account is remembered, where the same tap
+    IS the credential. A model that assigns positions mislabels one of them --
+    which is exactly the error that told the user their sign-in needed a
+    password they never see. The sequence is not a property of the institution
+    either: the same UCF account, hours apart, was asked for a username then a
+    passkey then a password, and later for nothing but a method. What changed
+    was state this tool created by keeping a profile.
+
+    So each state is recognised by what is on screen and handled on its own.
+    Three factors, one, or none is one code path.
+    """
     approver = approver or PushApprover()
-    # Set when a second factor is waiting on a human, so the final wait can be
-    # long enough for someone to pick up a phone. 30s is right for a redirect
-    # chain and absurd for a person.
-    awaiting_factor = False
 
     _log("Session expired or absent -- authenticating.")
     # Declare "no passkey" before the IdP can ask. This has to be installed
@@ -675,43 +597,16 @@ def log_in(page: Page, config: Config, approver: Approver | None = None) -> None
         _log("IdP session still valid; no credentials needed.")
         return
 
-    idp = _submit_credentials(page, config, approver.name)
+    # **Which family, decided once, from the page's own controls.** This is the
+    # same idea as the loop one level up: read what is there rather than trust
+    # configuration. It refuses when two match or none does.
+    idp = detect_idp(page)
     _log(f"Identity provider: {idp.name}.")
-    _settle(page)
-    _check_for_credential_rejection(page, config, idp=idp)
 
-    if on_duo_page(page):
-        _log(f"Duo challenge presented; using '{approver.name}' approval.")
-        # Snapshot the Duo page while we are actually on it. Its DOM is otherwise
-        # unobservable during development (reaching it needs real credentials),
-        # and this is the evidence any future selector repair depends on.
-        _log(f"Duo page captured: {save_debug_snapshot(page, 'duo-live')}")
-        complete_duo(page, approver)
-    elif (chosen := _choose_entra_factor(page, approver.name)):
-        # Entra's own second factor. `--factor` picks which: `push` waits for a
-        # phone tap (the page polls once a second, exactly as Duo does), and
-        # `passcode` prompts for the Authenticator's rotating code.
-        awaiting_factor = True
-        _settle(page)
-        if chosen == ENTRA_OTP:
-            _log("Second factor: Microsoft Authenticator code.")
-            _complete_entra_otp(page)
-        else:
-            _log("Second factor: Microsoft Authenticator push. Approve it on "
-                 "your phone -- match the number shown below.")
-            # **The number exists only on screen**, in a browser nobody can
-            # see, so it is printed here; without it the prompt is
-            # unapprovable even with the user sitting right there.
-            _report_pending_factor(page)
-    elif config.passwordless:
-        # The app tile was taken on the primary picker, so the approval is
-        # already in flight; there is nothing further to select.
-        awaiting_factor = True
-        _log("Passwordless sign-in: approve the request in Microsoft "
-             "Authenticator -- match the number shown below.")
-        _settle(page)
-        _report_pending_factor(page)
-    else:
+    state = LoginState(page=page, config=config, approver=approver, idp=idp)
+    _drive_login(state)
+
+    if not state.answered_a_challenge:
         # **Not necessarily a remembered device.** At UF, no Duo page means Duo
         # remembered this browser; at Temple it means the IdP asked for no
         # second factor at all (observed on the first live login, 2026-09-09).
@@ -719,22 +614,391 @@ def log_in(page: Page, config: Config, approver: Approver | None = None) -> None
         # device is remembered when nothing is remembering anything.
         _log("No second factor presented (remembered device, or none required "
              "by this institution).")
-
-    _settle(page)
-
-    # Poll rather than sampling once. After Duo the browser is still walking a
-    # redirect chain (Duo -> IdP -> SAML POST -> Canvas), so a single check runs
-    # mid-chain and reports failure for a login that is merely still in flight.
-    # This produced a "not authenticated" error for a session that was, in fact,
-    # sitting on the Canvas dashboard.
-    if not _wait_until_authenticated(
-            page, config, timeout_ms=150_000 if awaiting_factor else 30_000):
-        snapshot = save_debug_snapshot(page, "login-incomplete")
-        raise LoginError(
-            f"Login flow finished but we are not authenticated (url={page.url}). "
-            f"Snapshot: {snapshot}"
-        )
     _log(f"Authenticated. Landed on {page.url}")
+
+
+def _drive_login(state: LoginState) -> None:
+    """Answer whatever the provider asks, until it stops asking.
+
+    Returns only when authenticated; every other exit raises, so a caller can
+    never mistake "we gave up" for "we are in".
+    """
+    while True:
+        if _looks_authenticated(state.page.url, state.config):
+            return
+
+        found = _match(state)
+        if found is not None:
+            if len(state.fired) >= MAX_LOGIN_STEPS:
+                _refuse(state, "login-too-many-steps",
+                        f"stopped after {MAX_LOGIN_STEPS} authentication "
+                        f"steps without getting through")
+            state.fired.append(found.name)
+            _log(f"The provider is asking for {found.name}.")
+            if found.challenges_human:
+                state.answered_a_challenge = True
+            found.handle(state)
+            _settle(state.page)
+            continue
+
+        # Nothing we recognise is on screen. Either the flow is finishing (a
+        # redirect chain, or a challenge in flight on someone's phone) or it has
+        # stopped somewhere this build does not understand. Both are answered by
+        # watching -- for authentication OR for a state we do know.
+        if _wait_for_progress(state):
+            continue
+        _refuse(state, "login-incomplete",
+                "stopped at a state this build does not recognise")
+
+
+def _match(state: LoginState) -> Recogniser | None:
+    """The first recogniser that both matches and has not already fired.
+
+    **Order is a tie-break, not a sequence.** Every detector asks about the page
+    in front of it, so in a healthy flow at most one matches; the ordering only
+    decides what happens if two ever did. `idp_check` asserts single-match on
+    every fixture, which is evidence rather than a promise.
+    """
+    for recogniser in RECOGNISERS:
+        # **Once each.** Every state here is a one-shot in every flow measured,
+        # and this is what stops a provider re-presenting a challenge from
+        # getting it answered twice -- each push rings a real phone.
+        if recogniser.name in state.fired:
+            continue
+        try:
+            if recogniser.detect(state):
+                return recogniser
+        except PlaywrightError:
+            # A page mid-navigation destroys the evaluation context. That means
+            # the question cannot be answered *right now*, not that the state is
+            # absent; the caller polls again.
+            continue
+    return None
+
+
+def _wait_for_progress(state: LoginState) -> bool:
+    """Watch for authentication, or for a state we know how to answer.
+
+    Returns whether something happened worth looping on.
+
+    **Polls rather than sampling once.** After a second factor the browser is
+    still walking a redirect chain (Duo -> IdP -> SAML POST -> Canvas), and a
+    single check runs mid-chain and reports failure for a login that is merely
+    still in flight -- which once produced a "not authenticated" error for a
+    session sitting on the Canvas dashboard.
+
+    **It watches for new STATES too**, which the old fixed wait could not. A
+    provider that inserts a screen after the factor -- Entra's "Stay signed
+    in?", never yet seen here -- is then answered if a recogniser exists, and
+    named rather than left a mystery if one does not.
+    """
+    # Long enough for a person to find their phone when one is waiting on them;
+    # the shorter one is right for a redirect chain and absurd for a human.
+    deadline_ms = (state.human_patience_ms if state.awaiting_human
+                   else state.patience_ms)
+    waited = 0
+    while waited < deadline_ms:
+        if _looks_authenticated(state.page.url, state.config):
+            return True
+        if _match(state) is not None:
+            return True
+        try:
+            state.page.wait_for_timeout(1_000)
+        except PlaywrightError:
+            return False
+        waited += 1_000
+    return False
+
+
+def _refuse(state: LoginState, label: str, why: str) -> NoReturn:
+    """Stop, and say what the provider was offering when we stopped.
+
+    **Name what WAS offered.** Entra's tiles carry every method registered on
+    the account, so a refusal here can always be specific -- and a specific
+    refusal is the difference between "it did not work" and "this account only
+    has a security key, which needs hardware this process does not have".
+    """
+    page = state.page
+    # **A rejected USERNAME is reported as itself, not as a bad password.** The
+    # two need opposite fixes and send the reader to different lines of the
+    # secrets file, so the specific diagnosis wins over the generic refusal
+    # wherever it applies.
+    if _looks_like_a_rejected_username(state):
+        _raise_entra_stall(page, state.idp)
+
+    offered = _entra_factor_offered(page)
+    handled = ", ".join(state.fired) if state.fired else "nothing"
+    detail = ""
+    if offered:
+        detail = (f" The provider is offering: {', '.join(offered)} -- none of "
+                  f"which this build can answer.")
+    # The page's own words, which need no selector and work for states this
+    # code has never met.
+    _report_page_text(page)
+    snapshot = save_debug_snapshot(page, label)
+    raise LoginError(
+        f"Login {why} (url={page.url}). Answered so far: {handled}.{detail} "
+        f"Nothing was retried. Snapshot: {snapshot}"
+    )
+
+
+# --- the states, and how each is answered -----------------------------------
+
+#: Most states one sign-in may pass through before this stops and reports.
+#:
+#: **A bound, not a budget.** Every recogniser fires at most once, so a healthy
+#: login cannot reach it; it exists so a provider that cycles stops rather than
+#: spins.
+MAX_LOGIN_STEPS = 12
+
+
+@dataclass
+class LoginState:
+    """What the loop knows while driving one sign-in."""
+
+    page: Page
+    config: Config
+    approver: Approver
+    idp: IdP
+    #: Which states have been answered, in order. Doubles as the "once each"
+    #: guard and as what a refusal reports having done.
+    fired: list[str] = field(default_factory=list)
+    #: True once a challenge is in flight on a person's phone, which is the only
+    #: reason to wait minutes rather than seconds.
+    awaiting_human: bool = False
+    #: Whether any second factor was answered at all -- so the run can say
+    #: "none was presented" without claiming to know why.
+    answered_a_challenge: bool = False
+    #: How long to watch for something to happen when nothing is on screen we
+    #: recognise. **Named rather than buried**: these were two magic numbers in
+    #: the old sequence, and one of them is the difference between "a redirect
+    #: chain is still walking" and "a person has to find their phone".
+    patience_ms: int = 30_000
+    human_patience_ms: int = 150_000
+
+
+@dataclass(frozen=True)
+class Recogniser:
+    """One page state, and what to do about it.
+
+    **Named for what the PROVIDER is asking**, not for a step number. That is
+    the whole point of the design: `name` appears in the log and in refusals,
+    and reads correctly whichever position the state turns up in.
+    """
+
+    name: str
+    detect: Callable[[LoginState], bool]
+    handle: Callable[[LoginState], None]
+    #: Whether answering this asks something of a person. Drives both the long
+    #: wait and the "no second factor presented" line.
+    challenges_human: bool = False
+
+
+def _operable(state: LoginState, *selectors: str) -> bool:
+    """Whether any of these is a control a person could actually use.
+
+    **Never `is_visible()`**, which ignores opacity: Entra's screen-one password
+    box is `opacity: 0`, `aria-hidden` and 10x13px in a corner, and Playwright
+    calls it visible while `fill` succeeds on it. Typing a password into a box
+    nobody can see raises nothing at all.
+
+    This is what makes the detectors trustworthy enough to double as the wait.
+    The old code waited for an operable password box and then typed; here the
+    handler is only reachable when the box is *already* operable, so the
+    guarantee is structural rather than sequential.
+    """
+    return bool(state.page.evaluate(OPERABLE_PASSWORD, list(selectors)))
+
+
+def _present(state: LoginState, selector: str) -> bool:
+    """Whether the selector matches anything at all -- presence, not visibility."""
+    try:
+        return state.page.locator(selector).count() > 0
+    except PlaywrightError:
+        return False
+
+
+def _sees_duo(state: LoginState) -> bool:
+    return on_duo_page(state.page)
+
+
+def _answer_duo(state: LoginState) -> None:
+    _log(f"Using '{state.approver.name}' approval.")
+    # Snapshot the Duo page while we are actually on it. Its DOM is otherwise
+    # unobservable during development (reaching it needs real credentials), and
+    # this is the evidence any future selector repair depends on.
+    _log(f"Duo page captured: {save_debug_snapshot(state.page, 'duo-live')}")
+    complete_duo(state.page, state.approver)
+
+
+def _sees_single_screen_form(state: LoginState) -> bool:
+    """Shibboleth: both fields on one form, answered in one go.
+
+    **`two_screen` is what keeps this and "a password" from both matching.**
+    A Shibboleth form holds an operable password box too, so without the gate
+    two states would claim the same page -- and the loop would be relying on
+    its own ordering to resolve something that should not be ambiguous at all.
+    """
+    return (not state.idp.two_screen
+            and _operable(state, state.idp.password_field))
+
+
+def _answer_single_screen_form(state: LoginState) -> None:
+    _submit_single_screen(state.page, state.config, state.idp)
+    _settle(state.page)
+    _check_for_credential_rejection(state.page, state.config, idp=state.idp)
+
+
+def _sees_username_box(state: LoginState) -> bool:
+    return state.idp.two_screen and _operable(state, state.idp.username_field)
+
+
+def _answer_username_box(state: LoginState) -> None:
+    state.page.fill(state.idp.username_field, state.config.username)
+    state.page.click(state.idp.submit)
+    state.page.wait_for_load_state("domcontentloaded")
+
+
+def _sees_password_box(state: LoginState) -> bool:
+    # **Under `--passwordless` a password box is not a state we answer.** The
+    # app is the credential; typing a stored password would silently demote it
+    # to a second factor, which is the opposite of what was asked for.
+    if state.config.passwordless:
+        return False
+    # A password ON ITS OWN is the two-screen shape. A single-screen form is
+    # answered whole, by the recogniser above.
+    if not state.idp.two_screen:
+        return False
+    return _operable(state, state.idp.password_field)
+
+
+def _answer_password_box(state: LoginState) -> None:
+    state.page.fill(state.idp.password_field, state.config.password)
+    state.page.click(state.idp.submit)
+    state.page.wait_for_load_state("domcontentloaded")
+    _settle(state.page)
+    # **Fail fast on a rejection, next to the submission that could be
+    # rejected.** Repeatedly submitting a wrong password is how accounts lock.
+    _check_for_credential_rejection(state.page, state.config, idp=state.idp)
+
+
+def _sees_credential_picker(state: LoginState) -> bool:
+    """Entra's PRIMARY picker -- which credential to sign in with.
+
+    **Told apart from the verification picker by the attributes that actually
+    differ**, both measured 2026-09-11: primary tiles are keyed by
+    `data-test-cred-id`, verification tiles by `data-value` (an
+    `authMethodId`). Requiring no verification tiles here, and no primary
+    picker there, makes the two mutually exclusive rather than order-dependent
+    -- so neither can be mistaken for the other on a page carrying both.
+    """
+    return (_present(state, ENTRA_CRED_PICKER)
+            and not _entra_factor_offered(state.page))
+
+
+def _answer_credential_picker(state: LoginState) -> None:
+    if state.config.passwordless:
+        # **The app IS the credential here**, so there is no password step at
+        # all: nothing is typed afterwards and none is stored.
+        if not _choose_primary_method(state.page, ENTRA_APP_TILE,
+                                      ENTRA_APP_WORDS):
+            snapshot = save_debug_snapshot(state.page, "login-no-passwordless")
+            raise LoginError(
+                f"Passwordless sign-in was asked for, but this account was not "
+                f"offered an authenticator app as a primary credential "
+                f"(url={state.page.url}). Drop --passwordless to use the stored "
+                f"password instead. Snapshot: {snapshot}")
+        state.awaiting_human = True
+        _log("Passwordless sign-in: approve the request in Microsoft "
+             "Authenticator -- match the number shown below.")
+        _settle(state.page)
+        _report_pending_factor(state.page)
+        return
+
+    # **"No password box" is not the end of the road.** A tenant whose default
+    # method is a passkey shows that first; the password lives behind "Sign in
+    # another way". Found only by going one screen further -- the whole UCF flow
+    # was called impossible on the strength of the first screen it rendered.
+    if not _choose_password_method(state.page):
+        _raise_entra_stall(state.page, state.idp)
+
+
+def _sees_method_picker(state: LoginState) -> bool:
+    """Entra's verification tiles -- which factor to answer with."""
+    return (not _present(state, ENTRA_CRED_PICKER)
+            and bool(_entra_factor_offered(state.page)))
+
+
+def _answer_method_picker(state: LoginState) -> None:
+    chosen = _choose_entra_factor(state.page, state.approver.name)
+    if chosen is None:
+        # `FidoKey` alone lands here, and correctly: it needs hardware this
+        # process does not have, so there is nothing to fall back to.
+        _refuse(state, "login-no-answerable-factor",
+                "reached a verification step it cannot answer")
+    state.awaiting_human = True
+    _settle(state.page)
+    if chosen == ENTRA_OTP:
+        # The code box is the next state, recognised on its own.
+        _log("Second factor: Microsoft Authenticator code.")
+        return
+    _log("Second factor: Microsoft Authenticator push. Approve it on your "
+         "phone -- match the number shown below.")
+    _report_pending_factor(state.page)
+
+
+def _looks_like_a_rejected_username(state: LoginState) -> bool:
+    """We typed a username, waited, and the box is *still* asking for one.
+
+    **Deliberately NOT a recogniser**, and the reason is worth keeping: it
+    would fire on a perfectly healthy login. Entra's view switch is client-side
+    and takes the better part of a second, during which the username box is
+    still operable and the password box is not -- so a recogniser saying "the
+    username box is still there" matches the ordinary flow mid-switch and
+    refuses a sign-in that was about to work.
+
+    The conclusion is only sound *after* the wait has been spent, which is
+    exactly where `_refuse` stands. Recognisers answer what is on screen now;
+    this answers what is still on screen after nothing else happened.
+    """
+    if not state.idp.two_screen or "a username" not in state.fired:
+        return False
+    try:
+        return _operable(state, state.idp.username_field)
+    except PlaywrightError:
+        return False
+
+
+def _sees_code_box(state: LoginState) -> bool:
+    return _present(state, ENTRA_OTP_FIELD)
+
+
+def _answer_code_box(state: LoginState) -> None:
+    state.awaiting_human = True
+    _complete_entra_otp(state.page)
+
+
+#: Every page state this build can answer.
+#:
+#: **A set, not a script.** Adding a provider's new screen is a row here, not a
+#: re-plumbing of a sequence -- the same reasoning that made `IDPS` a table.
+#: Shibboleth is not an exception to the model: it collapses several states into
+#: one form and hands the rest to Duo, which is one recogniser matching a page
+#: that happens to hold two fields.
+RECOGNISERS: tuple[Recogniser, ...] = (
+    Recogniser("a Duo challenge", _sees_duo, _answer_duo,
+               challenges_human=True),
+    Recogniser("a sign-in form", _sees_single_screen_form,
+               _answer_single_screen_form),
+    Recogniser("a username", _sees_username_box, _answer_username_box),
+    Recogniser("a password", _sees_password_box, _answer_password_box),
+    Recogniser("an authenticator code", _sees_code_box, _answer_code_box,
+               challenges_human=True),
+    Recogniser("which credential to use", _sees_credential_picker,
+               _answer_credential_picker),
+    Recogniser("which verification method to use", _sees_method_picker,
+               _answer_method_picker, challenges_human=True),
+)
 
 
 #: Entra's second-factor tiles. `data-value` carries the `authMethodId` straight
@@ -925,7 +1189,18 @@ def _report_pending_factor(page: Page) -> None:
         ),
         sys.stderr,
     )
+    _report_page_text(page)
 
+
+def _report_page_text(page: Page) -> None:
+    """Print the page's own visible words.
+
+    **Needs no selector, and so works for states this code has never met** --
+    which is why it is also what a refusal prints. Split out from
+    `_report_pending_factor` when the login became a loop: a state we do not
+    recognise must report itself, but must NOT be given the Authenticator box,
+    which would tell the reader to approve something nobody asked for.
+    """
     try:
         text = page.inner_text("body") or ""
     except PlaywrightError:
