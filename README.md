@@ -216,7 +216,11 @@ provider remembers the device (Duo: ~10 hours), runs need no interaction at all.
 |------|---------|-------|
 | enrollment | both active and archived | `--active` / `--archived` |
 | publish state | any | `--published` / `--unpublished` |
-| favorite | **favorites only** | `--favorite` / `--unmarked`; `--all` opens every axis |
+| favorite | **favorites only** | `--favorite` / `--unmarked` |
+
+**`--all` opens all three axes at once** — both sides of each, the widest possible scope.
+It therefore does not compose with a narrowing flag: `--all --published` is every course,
+not every published one, because `--all` has already named `--unpublished` too.
 
 **Naming both sides of an axis unions them** — `--active --archived` is every enrollment,
 which is what the words say. Favorites is the one deliberately narrowed default — it is
@@ -455,6 +459,21 @@ the write and then altered it).
 
 After writing, `push` re-reads the assignment's own page state and compares date *and* time,
 so a save that silently did not take is reported rather than assumed.
+
+## Exit codes
+
+`push` uses its exit code to say what it found, which matters when you are reading a log
+rather than a terminal:
+
+| code | means |
+|------|-------|
+| `0` | nothing to do, or the commit finished cleanly |
+| `1` | **a preview with changes pending** — not an error |
+| `2` | one or more items did not land (each reason is printed above), or the run stopped on an error such as an unreadable sheet, a refused login or a rejected write |
+| `3` | halted part-way through creating, and the message says what state Canvas is in |
+
+**`1` is the one to be careful with.** A dry run that found work to do exits non-zero by
+design, so a script treating any non-zero as failure will call a healthy preview broken.
 
 ## Data handling
 
