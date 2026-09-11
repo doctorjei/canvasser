@@ -551,6 +551,21 @@ def render_creates(plans, refusals) -> list[str]:
             out.append(f"      {fit(column, 18)}"
                        f"{_paint(fit('(new)', 14), GREY)}"
                        f" -> {_paint(plan.values[column], BOLD_GREEN)}")
+        # **`published` is not in `values` and must still be shown here.** It
+        # chooses the Save button rather than being typed into a control, so
+        # iterating `values` -- which is every other field on the row -- leaves
+        # the preview silent about the one field a student sees immediately.
+        # Printed for `false` as well as `true`: "this will be created where
+        # nobody can see it" is exactly as much of a surprise as the reverse,
+        # and a preview that only speaks up in one direction teaches the reader
+        # that silence means unpublished.
+        out.append(f"      {fit('published', 18)}"
+                   f"{_paint(fit('(new)', 14), GREY)}"
+                   + (f" -> {_paint('true', BRIGHT_BOLD_GREEN)}"
+                      + _paint("   students will see this", BRIGHT_BOLD_GREEN)
+                      if plan.publish else
+                      f" -> {_paint('false', GREY)}"
+                      + _paint("   created unpublished", GREY)))
         for note in plan.notes:
             # Not a refusal: a field left to Canvas's own default, said out
             # loud because a default is only harmless when it is expected.

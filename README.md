@@ -430,6 +430,11 @@ NEW,Homework 1,assignment,Exercises,10,points,online_upload,...
 - **Close the file first.** `push` refuses to create anything while your spreadsheet still
   has the sheet open, and re-reads the file after each write-back to confirm the id landed.
   If a spreadsheet saved `NEW` back over a real id, the next push would create a duplicate.
+- **`published` works here and only here.** Set it to `true` and the assignment is created
+  already visible to students, using the "Save & Publish" button Canvas offers while an
+  assignment is unpublished. Blank or `false` creates it unpublished. Either way the preview
+  states which, because that is the one setting a student notices immediately. On a row for
+  an assignment that **already exists**, `published` is still reported `NOT WRITABLE YET`.
 - **A new assignment has no dates**, because dates live in the other sheet. Run
   `canvasser pull` afterwards to pick the new rows up, then edit and push the datesheet.
 

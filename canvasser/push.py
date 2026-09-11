@@ -1011,15 +1011,12 @@ def plan_creates(
         if "assignment_group" not in values:
             notes.append(
                 "assignment_group is blank; Canvas puts it in the first group")
-        if not publish:
-            # Stated even though it is the safe direction. A create is the one
-            # operation with no undo, and "I made it and nobody can see it" is
-            # a surprise worth one line -- the opposite surprise would be far
-            # worse, which is why unpublished is the default rather than a
-            # thing to be argued into.
-            notes.append(
-                "published is blank or false; the assignment will be created "
-                "UNPUBLISHED and students will not see it")
+        # **No note for `published` either way.** `render_creates` prints the
+        # state on every create, in both directions, in the field list where a
+        # reader is already looking -- so a note here would say the same thing
+        # twice in the same preview. The other notes exist because their fields
+        # are ABSENT from that list when Canvas defaults them; `published` never
+        # is.
 
         label = title or f"(untitled row at line {line})"
         if reasons:
