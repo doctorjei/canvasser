@@ -445,8 +445,20 @@ def render_nav(s, enabled: bool) -> list[str]:
 
 #: Column widths, to the user's spec. Every gap is two spaces; the total is 79,
 #: so the table fits an 80-column terminal without wrapping.
-COLUMNS = (("ID Num", 6), ("Fav", 3), ("Pub", 3), ("Course Name", 32),
-           ("Term", 13), ("Role(s)", 12))
+#: The id column's FLOOR, not its width -- `course_column_widths` grows it to
+#: fit the data and takes the difference out of the name column, so the table
+#: still totals 79 and still fits an 80-column terminal.
+ID_WIDTH = 6
+NAME_WIDTH = 32
+
+#: The name column never shrinks below this, however long an id is. Past that
+#: point the table exceeds 79 columns and wraps -- deliberately: see
+#: `course_column_widths` for why wrapping beats a truncated id or an
+#: unreadable name.
+MIN_NAME_WIDTH = 12
+
+COLUMNS = (("ID Num", ID_WIDTH), ("Fav", 3), ("Pub", 3),
+           ("Course Name", NAME_WIDTH), ("Term", 13), ("Role(s)", 12))
 GAP = "  "
 BOLD_UNDERLINE_WHITE = BOLD_WHITE_U
 
@@ -676,8 +688,46 @@ def render_info_diff(diff) -> list[str]:
     return out
 
 
+def course_column_widths(courses: list) -> tuple[int, int]:
+    """`(id_width, name_width)` for this particular set of courses.
+
+    **An id column that truncates is useless, and the fixed width of 6 did**
+    -- found the moment a third institution appeared: UCF's course ids are
+    seven digits, so `courses` rendered them as `151...` and the one value a
+    person needs in order to run `pull` could not be read or copied.
+
+    Names and terms may still truncate, which was already accepted
+    ("Development Term" never fit). The asymmetry is deliberate: a shortened
+    name is a cosmetic loss, a shortened id is a dead end.
+
+    The width is taken from the data and paid for out of the **name** column,
+    so the table still adds up to the same 79 columns and still fits an
+    80-column terminal. Never narrower than the header, or `ID Num` itself
+    would be clipped.
+
+    **No maximum id length is assumed**, deliberately. Canvas ids are bigints,
+    and Instructure's sharded *global* ids are longer than the local ones a
+    course URL shows -- six digits at UF and Temple, seven at UCF, and nothing
+    here has measured the ceiling. Rather than encode a guess, the name column
+    gives way down to `MIN_NAME_WIDTH`; past that the table grows wider than 79
+    and wraps.
+
+    **Wrapping is the right failure.** The alternatives are truncating the id
+    (a dead end -- it is what `pull` takes) or squeezing the name to nothing (a
+    table of anonymous rows). A wrapped line is ugly and complete, which beats
+    tidy and useless.
+    """
+    widest = max((len(str(c.id)) for c in courses), default=0)
+    id_width = max(ID_WIDTH, widest)
+    name_width = max(MIN_NAME_WIDTH, NAME_WIDTH - (id_width - ID_WIDTH))
+    return id_width, name_width
+
+
 def print_course_table(courses: list) -> None:
-    header = GAP.join(fit(label, width) for label, width in COLUMNS)
+    id_width, name_width = course_column_widths(courses)
+    widths = {"ID Num": id_width, "Course Name": name_width}
+    header = GAP.join(fit(label, widths.get(label, width))
+                      for label, width in COLUMNS)
     colour = colors_enabled()
     print(f"{BOLD_UNDERLINE_WHITE if colour else ''}{header}{RESET if colour else ''}")
 
@@ -692,10 +742,10 @@ def print_course_table(courses: list) -> None:
 
         row = GAP.join(
             (
-                fit(course.id, 6),
+                fit(course.id, id_width),
                 fit("★" if course.favorite else "", 3, centre=True),
                 pub,
-                fit(course.name, 32),
+                fit(course.name, name_width),
                 fit(course.term, 13),
                 fit(course.role, 12),
             )
