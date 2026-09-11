@@ -333,6 +333,10 @@ because there is nothing for it to mark.
 - **`kind` explains the blanks.** A classic quiz's page carries no `grading_type`,
   `submission_types` or `peer_reviews` at all, so those cells are empty on every quiz row —
   that is a fact about quizzes, not a failed read.
+- **`kind` is one of `assignment`, `quiz` or `discussion`.** A **graded discussion** is
+  listed among your assignments and is read like any other row, dates and settings included.
+  It cannot be *written*: Canvas edits those on its discussions app, which canvasser does not
+  drive, so `push` names the row and refuses it — in the preview, before you commit.
 - **`override_count` tells you which assignments carry overrides** before you start editing,
   rather than when `push` refuses the row.
 - Values are written exactly as Canvas reports them, including `allowed_attempts = -1`

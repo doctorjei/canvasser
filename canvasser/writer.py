@@ -79,6 +79,7 @@ from playwright.sync_api import (Error as PlaywrightError, Page,
 
 from .browser import save_debug_snapshot
 from .config import Config
+from .assignments import ENV_PROBE
 from .dateparse import DateFormatError, resolve, zone_of
 # **The same function the diff parses boolean cells with**, not a second one.
 # Two implementations of "what does this cell say" would eventually disagree,
@@ -405,6 +406,46 @@ def read_overrides(page: Page) -> int:
     return page.evaluate(_OVERRIDE_COUNT)
 
 
+def refuse_if_discussion(page: Page, assignment_id: str) -> None:
+    """Refuse a graded discussion before the readiness gate can time out on it.
+
+    **Reading one is supported; writing one is not** (built 2026-09-11).
+    `/assignments/<id>/edit` redirects to `/discussion_topics/<t>/edit`, a React
+    discussions app that shares no control with the form every other write here
+    drives -- so there is nothing on the page for `_apply_field_values` or the
+    date widget to find.
+
+    Without this the failure is merely *slow and obscure*: `wait_for_form`
+    hunts for a Save button that is not there for its full 90s, then raises
+    about readiness, which sends the reader looking at the wrong thing. It also
+    fires on BOTH sheets -- the datesheet carries no `kind` column at all, so
+    this choke point is the only place that catches a date write.
+
+    **The rule is not restated here.** `kind` comes from
+    `assignments.ENV_PROBE`, the same probe `pull` reads the sheet with, so
+    "what counts as a discussion" has one implementation. Two spellings of one
+    question is the shape that has cost this project three bugs.
+
+    A probe that cannot run does **not** refuse: nothing has been written at
+    that point, and `wait_for_form` is still ahead to catch a page with no form
+    on it. Failing closed here would mean refusing real assignments whenever an
+    evaluate happened to race a navigation.
+    """
+    try:
+        env = page.evaluate(ENV_PROBE) or {}
+    except PlaywrightError:
+        return
+    if env.get("kind") != "discussion":
+        return
+    raise WriteRefused(
+        f"assignment {assignment_id} is a GRADED DISCUSSION. Canvas edits "
+        f"those on its discussions app ({page.url}), which shares no control "
+        f"with the assignment form this tool drives, so nothing can be written "
+        f"there -- not dates and not settings. `pull` reads it fine; change it "
+        f"in Canvas by hand. Refusing."
+    )
+
+
 def profile_timezone(page: Page) -> str:
     return page.evaluate("() => window.ENV?.TIMEZONE || ''")
 
@@ -427,6 +468,7 @@ def apply_changes(
     for why both of those are non-negotiable.
     """
     _open_editor(page, config, course_id, assignment_id)
+    refuse_if_discussion(page, assignment_id)
     # NOT a sleep. See SAVE_READY: the form's own submit button reports when it
     # is done initialising, and typing before then is how dates get silently
     # reverted and the wrong values saved.
@@ -1189,6 +1231,7 @@ def apply_settings(
     is unaffected; a `title` change without it refuses rather than guessing.
     """
     _open_editor(page, config, course_id, assignment_id)
+    refuse_if_discussion(page, assignment_id)
     wait_for_form(page)
 
     # **The override refusal carries across, and the reason is not obvious.**

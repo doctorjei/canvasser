@@ -628,6 +628,18 @@ def render_info_diff(diff) -> list[str]:
     for row in diff.changed:
         out.append(_paint(f"  {row.title}", BOLD_WHITE)
                    + _paint(f"   #{row.assignment_id}", GREY))
+        # **Said in the PREVIEW, not only at commit.** The write path refuses a
+        # discussion (`writer.refuse_if_discussion`), but a refusal discovered
+        # mid-run is the complaint `override_count` exists to answer -- and
+        # unlike an override, this one is knowable from the read pass that has
+        # already happened. Loud, because the edit will not land.
+        if row.kind == "discussion":
+            out.append(_paint(
+                "      ^ GRADED DISCUSSION -- Canvas edits these on its "
+                "discussions app,", BRIGHT_BOLD_RED))
+            out.append(_paint(
+                "        which this build cannot drive. This row will be "
+                "refused.", BRIGHT_BOLD_RED))
         for change in row.changes:
             out.append(
                 f"      {fit(change.field, 18)}"

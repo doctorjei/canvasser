@@ -45,14 +45,41 @@ ASSIGNMENT_HREF = re.compile(r"/courses/\d+/(?:assignments|quizzes)/(\d+)")
 #: assignments ENV.ASSIGNMENT; both carry `due_at`. Overrides live in
 #: ENV.ASSIGNMENT_OVERRIDES, which is a far better count of extra date rows than
 #: counting table rows and hoping the markup did not change.
+#: **A graded discussion is the THIRD kind, and it hides its assignment one
+#: level down** (probed at UCF 2026-09-11). Canvas lists it on the assignments
+#: index like anything else, redirects `/assignments/<id>/edit` to
+#: `/discussion_topics/<t>/edit`, and puts a FULL assignment object -- dates,
+#: points, grading, submission types, overrides -- at
+#: `ENV.DISCUSSION_TOPIC.ATTRIBUTES.assignment`. Before this, the walk saw
+#: neither `ENV.ASSIGNMENT` nor `ENV.QUIZ`, refused (rightly -- a blank date
+#: cell means *clear this date*), and took the whole pull down with it.
+DISCUSSION_EXPR = ("(ENV.DISCUSSION_TOPIC && ENV.DISCUSSION_TOPIC.ATTRIBUTES "
+                   "&& ENV.DISCUSSION_TOPIC.ATTRIBUTES.assignment)")
+
+#: "Does this page carry something with dates on it?" -- **one expression, used
+#: by the readiness wait AND by the probe that follows it.**
+#:
+#: They must not be able to disagree. When `_ENV_READY` knew only about
+#: assignments and quizzes, a discussion could never satisfy it: every one cost
+#: the full `ENV_TIMEOUT_MS` and was then read at whatever moment the timeout
+#: happened to expire, rather than when its data arrived. A readiness check that
+#: tests for something other than what the caller reads is not a readiness
+#: check -- which is this project's oldest lesson wearing a new hat.
+SUBJECT_EXPR = f"(ENV.ASSIGNMENT || ENV.QUIZ || {DISCUSSION_EXPR})"
+
 ENV_PROBE = """() => {
     if (typeof ENV === 'undefined') return null;
-    const subject = ENV.ASSIGNMENT || ENV.QUIZ || {};
+    const discussion = """ + DISCUSSION_EXPR + """ || null;
+    // Which object won, asked once: `kind` and the override list both need it,
+    // and two spellings of one question is the shape that has cost this project
+    // three separate bugs.
+    const isDiscussion = !ENV.ASSIGNMENT && !ENV.QUIZ && !!discussion;
+    const subject = """ + SUBJECT_EXPR + """ || {};
     return {
         // Whether a date-bearing subject was on the page at all. A page with
-        // neither is not "an assignment with no due date" -- it is the wrong
+        // none is not "an assignment with no due date" -- it is the wrong
         // page, and reporting it as an empty date loses real data silently.
-        has_subject: !!(ENV.ASSIGNMENT || ENV.QUIZ),
+        has_subject: !!""" + SUBJECT_EXPR + """,
         assignment_id: ENV.ASSIGNMENT_ID != null ? String(ENV.ASSIGNMENT_ID) : null,
         // Canvas's three date boxes. The UI labels unlock_at "Available from"
         // and lock_at "Until"; the API names are what the sheet records.
@@ -62,8 +89,16 @@ ENV_PROBE = """() => {
         lock_at: subject.lock_at ?? null,
         user_tz: ENV.TIMEZONE ?? null,
         course_tz: ENV.CONTEXT_TIMEZONE ?? null,
-        overrides: (Array.isArray(ENV.ASSIGNMENT_OVERRIDES)
-            ? ENV.ASSIGNMENT_OVERRIDES : []).map(o => ({
+        // A discussion page carries no `ENV.ASSIGNMENT_OVERRIDES` at all; its
+        // cards ride on the nested assignment. Chosen by which subject won
+        // rather than by "whichever list is non-empty" -- that would quietly
+        // change what an ordinary assignment reports, and the override count is
+        // what the write path refuses on.
+        overrides: (isDiscussion
+            ? (Array.isArray(subject.assignment_overrides)
+                ? subject.assignment_overrides : [])
+            : (Array.isArray(ENV.ASSIGNMENT_OVERRIDES)
+                ? ENV.ASSIGNMENT_OVERRIDES : [])).map(o => ({
                 id: o && o.id != null ? String(o.id) : '',
                 title: (o && o.title) || '',
                 due_at: (o && o.due_at) || null,
@@ -85,7 +120,14 @@ ENV_PROBE = """() => {
         // grading_type, no submission_types and no peer_reviews at all, so
         // those cells are blank for quizzes -- and a blank that is not
         // explained reads as a scraping failure.
-        kind: ENV.ASSIGNMENT ? 'assignment' : (ENV.QUIZ ? 'quiz' : ''),
+        // **`discussion` is a third value, not a relabelling of `assignment`**
+        // (user's call, 2026-09-11). The object read really is an assignment,
+        // but the FORM behind it is a React discussions app sharing nothing
+        // with the one `writer.py` drives -- so a row claiming `assignment`
+        // would promise a write this build cannot make, and fail at the
+        // readiness gate with a puzzling message instead of a clear refusal.
+        kind: ENV.ASSIGNMENT ? 'assignment'
+            : (ENV.QUIZ ? 'quiz' : (discussion ? 'discussion' : '')),
         points_possible: subject.points_possible ?? null,
         grading_type: subject.grading_type ?? null,
         submission_types: subject.submission_types ?? null,
@@ -357,7 +399,7 @@ def _date_urls(href: str) -> tuple[str, str | None]:
 ENV_TIMEOUT_MS = 8_000
 
 #: True once the page's JS state carries something with dates on it.
-_ENV_READY = "() => !!(window.ENV && (window.ENV.ASSIGNMENT || window.ENV.QUIZ))"
+_ENV_READY = f"() => !!(window.ENV && {SUBJECT_EXPR})"
 
 
 def _probe_at(page: Page, url: str, assignment_id: str) -> dict:
