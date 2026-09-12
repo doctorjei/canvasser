@@ -515,9 +515,12 @@ Two things another institution must supply, because neither is guessable:
 - **`CANVAS_SSO_PATH`** — the Canvas login route. There is deliberately no default:
   `/login/saml/355` is *UF's own* SAML provider id, and using it elsewhere would send your
   credentials to UF's identity provider. Unset, a non-UF institution is refused.
-- **A supported second factor.** Duo is what has been implemented and tested. The factor
-  sits behind an interface, so another one is an addition rather than a rewrite — but it is
-  not written yet.
+- **A supported second factor.** Two are implemented and have been used against a live
+  login: **Duo** (UF) and **Microsoft Authenticator** (UCF), each with a push to approve or
+  a code to type. Temple asks for none, and that works too — whether a second factor is
+  presented at all is the provider's decision. A third would be an addition rather than a
+  rewrite: sign-in is driven by recognising what is on screen, not by following a fixed
+  sequence of steps.
 
 **Only `*.instructure.com` hosts are supported.** Self-hosted and vanity-domain Canvas are
 refused outright: the institution is identified by its subdomain, and a host without one

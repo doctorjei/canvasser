@@ -30,12 +30,16 @@ profile's own history.
 detector and an answer, dispatched against whatever is on screen until we are
 authenticated or nothing matches.
 
-    a username                  -> type it                (absent if known)
-    which credential to use     -> password, or the app with --passwordless
-    a password                  -> type it       (absent if none is wanted)
-    which verification method   -> choose by authMethodId
-    an authenticator code       -> prompt the human; never stored
-    a Duo challenge             -> hand to the approver
+    a sign-in form                   -> both fields at once (Shibboleth)
+    a username                       -> type it            (absent if known)
+    which credential to use          -> password, or the app with --passwordless
+    a password                       -> type it   (absent if none is wanted)
+    which verification method to use -> choose by authMethodId
+    an authenticator code            -> prompt the human; never stored
+    a Duo challenge                  -> hand to the approver
+
+Those are the names `RECOGNISERS` actually carries, and they are what the log and
+any refusal print.
 
 **No state knows its index**, so three factors, one, or none is one code path,
 and a provider that inserts a screen tomorrow needs a row in `RECOGNISERS`
