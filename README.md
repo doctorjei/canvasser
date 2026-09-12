@@ -28,8 +28,8 @@ automation is the better-supported path for this institution.
 >
 > **New assignments** can be created from the settings sheet: put `NEW` in the id cell and
 > the id Canvas assigns is written straight back into it, so the row becomes an ordinary
-> edit and a second push cannot create a duplicate. Assignments only — quizzes are refused,
-> since the two engines use different endpoints. **There is no delete command**, so anything
+> edit and a second push cannot create a duplicate. Assignments only — quizzes and
+> discussions are refused, since Canvas makes each of those somewhere else. **There is no delete command**, so anything
 > created by mistake has to be removed in Canvas by hand.
 >
 > **Not supported:** assignments with per-student or per-section overrides. Saving Canvas's
@@ -432,9 +432,12 @@ NEW,Homework 1,assignment,Exercises,10,points,online_upload,...
 - **`assignment_group` and `kind` become writable on a `NEW` row**, and only there. Editing
   an assignment never needs to set them; creating one always does. The group is named the
   way the sheet shows it — the group's own name, not its id.
-- **Quizzes are not built.** `kind=quiz` is refused rather than quietly made an assignment:
-  classic quizzes and New Quizzes are created at different endpoints and the sheet has no
-  column that says which you mean. Create the quiz in Canvas and `pull` again.
+- **Only `assignment` can be created.** `kind=quiz` is refused rather than quietly made an
+  assignment: classic quizzes and New Quizzes are created at different endpoints and the
+  sheet has no column that says which you mean. `kind=discussion` is refused too — Canvas
+  makes those on a page canvasser does not drive. This matters more than it used to now
+  that `pull` writes `discussion` rows: copying one to make a new row carries the `kind`
+  cell with it. Make the quiz or discussion in Canvas and `pull` again.
 - **Close the file first.** `push` refuses to create anything while your spreadsheet still
   has the sheet open, and re-reads the file after each write-back to confirm the id landed.
   If a spreadsheet saved `NEW` back over a real id, the next push would create a duplicate.
