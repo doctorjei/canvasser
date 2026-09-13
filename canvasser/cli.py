@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Sequence
 from datetime import date
 from pathlib import Path
 
@@ -95,6 +96,7 @@ from .writer import (
     CreateUnrecorded,
     WriteFailed,
     WriteRefused,
+    Written,
     apply_changes,
     apply_settings,
     create_assignment,
@@ -615,7 +617,7 @@ def _commit_creates(page, config, course_id: str, sheet_path: Path, plans):
 
     for plan in plans:
         try:
-            new_id, _written, inherited = create_assignment(
+            new_id, written, inherited = create_assignment(
                 page, config, course_id, plan.kind, plan.title, plan.values,
                 publish=plan.publish)
         except (WriteRefused, WriteFailed) as exc:
@@ -669,8 +671,62 @@ def _commit_creates(page, config, course_id: str, sheet_path: Path, plans):
         # value rather than defaulting to 0 (measured 2026-09-10).
         for column, value in sorted(inherited.items()):
             print(f"      {column:<18}(blank in the sheet) -> {value}")
+        # **The same side-effect report as the edit path**, so a field the form
+        # touched on its own is not visible on one path and silent on the
+        # other. Both paths run `_apply_field_values`, which is precisely why
+        # it must not be reported in only one of them. There is no ENV read to
+        # verify it against here: a create is verified by the round trip, and
+        # this line is a statement about the form, not about what Canvas kept.
+        for side in side_effects(written):
+            print(side_effect_line(side))
 
     return created, problems, False
+
+
+def side_effects(written: Sequence[Written]) -> list[Written]:
+    """The fields a write touched that nobody asked it to touch.
+
+    A `note` is the writer's own sentence about why a field it was never given
+    got involved -- today only `writer._carry_attempts`, about an attempts
+    limit a submission-type change either carried or could not keep.
+    """
+    return [w for w in written if w.note]
+
+
+def side_effect_line(side: Written) -> str:
+    """The one line a side effect gets, on both write paths.
+
+    Pure, and out here rather than inline, for the reason `chosen_displays` is:
+    `cmd_push_info` needs a browser and a live course, so nothing offline can
+    see what it prints. That is not a hypothetical -- every offline check for
+    publish-at-create passed while the dry run said nothing about publishing,
+    because all of them asserted the model and none the rendering.
+    """
+    return f"      {side.field:<18}{side.note}"
+
+
+def side_effect_report(
+    touched: Sequence[Written], got: dict[str, str],
+) -> list[tuple[Written, str, bool]]:
+    """`(field, what to print, did Canvas keep it)` for each side effect.
+
+    The second line is the one that matters: a limit put back on the form is
+    worth nothing unless Canvas still holds it after the save, and only ENV can
+    say so. Compared through `same_value`, like every other post-write check
+    here, so `3` and `3.0` cannot report a preserved limit as lost.
+    """
+    report = []
+    for side in touched:
+        landed = got.get(side.field, "")
+        ok = same_value(side.field, landed, side.typed)
+        report.append((
+            side,
+            f"{side_effect_line(side)}\n"
+            f"      {'':<18}Canvas now: {landed}   "
+            f"{'OK' if ok else 'MISMATCH'}",
+            ok,
+        ))
+    return report
 
 
 def cmd_push_info(args: argparse.Namespace, sheet_path: Path) -> int:
@@ -791,10 +847,20 @@ def cmd_push_info(args: argparse.Namespace, sheet_path: Path) -> int:
             try:
                 # `kind` comes from the live read, not the sheet: it aims the
                 # title control, and the two forms share no part of it.
-                apply_settings(page, config, course_id, row.assignment_id,
-                               wanted, kind=row.kind)
-                got = verify_settings(page, config, course_id, row.assignment_id,
-                                      tuple(wanted))
+                written = apply_settings(page, config, course_id,
+                                         row.assignment_id, wanted,
+                                         kind=row.kind)
+                # **A write can touch a field the sheet never named**, and then
+                # that field needs the same verification as the ones it did.
+                # A submission-type write can take an attempts limit with it
+                # (`writer._carry_attempts`), and the loss happens *server
+                # side* -- the form looked correct throughout on 2026-09-13 --
+                # so ENV is the only thing that can say what became of it.
+                touched = side_effects(written)
+                got = verify_settings(
+                    page, config, course_id, row.assignment_id,
+                    tuple(wanted) + tuple(w.field for w in touched
+                                          if w.field not in wanted))
             except (WriteRefused, WriteFailed) as exc:
                 print(f"  REFUSED {row.title}: {exc}", file=sys.stderr)
                 problems.append(f"{row.title} #{row.assignment_id}")
@@ -832,6 +898,24 @@ def cmd_push_info(args: argparse.Namespace, sheet_path: Path) -> int:
                     print(f"      {'':<18}why: {why}", file=sys.stderr)
                     problems.append(
                         f"{row.title} #{row.assignment_id} ({change.field})")
+
+            # **Said out loud, because nobody asked for it.** A field the sheet
+            # never mentioned was touched by the form itself, and silence here
+            # is exactly what let a submission-type write wipe an attempts
+            # limit unnoticed. The sentence is the writer's -- it is the only
+            # part of this that knows why the field was involved at all.
+            for side, line, ok in side_effect_report(touched, got):
+                print(line)
+                if not ok:
+                    # A limit that did not survive the save is a setting lost
+                    # by our own write, which is the whole reason this path
+                    # exists. It counts as a problem and the run exits 2.
+                    print(f"      {'':<18}why: Canvas holds "
+                          f"{got.get(side.field, '')!r} for a field this write "
+                          f"was only trying to preserve",
+                          file=sys.stderr)
+                    problems.append(
+                        f"{row.title} #{row.assignment_id} ({side.field})")
 
     if created:
         # Said again at the end, because the create lines scroll past on a long

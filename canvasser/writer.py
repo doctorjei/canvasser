@@ -113,6 +113,14 @@ class Written:
     wanted: str      # course-local, as the sheet expressed it
     typed: str       # profile-local, as the form received it
     confirmed: str   # what ENV held afterwards, course-local
+    #: A whole sentence for the person running this, when something happened to
+    #: the field that the sheet did not ask for. Empty for an ordinary write,
+    #: which the caller already reports from the diff it was given.
+    #:
+    #: Phrased here rather than at the call site because the caller has no way
+    #: to know *why* a field it never asked about was touched -- see
+    #: `_carry_attempts`, the one thing that sets it today.
+    note: str = ""
 
 
 def to_profile_time(
@@ -771,6 +779,56 @@ _ATTEMPTS_PROBE = """() => {
     };
 }"""
 
+
+def _attempts_operable(found: dict | None) -> bool:
+    """Whether the attempts pair is there, unambiguous, and on show.
+
+    Canvas hides the pair unless the assignment accepts submissions, and its
+    select has neither an id nor a name, so more than one match is not a thing
+    to choose between. Both halves are the same question -- *can this control
+    be read or written as the assignment's state* -- and it is asked in two
+    places, so it is written once.
+    """
+    return bool(found) and found.get("select_count") == 1 and bool(
+        found.get("select_visible"))
+
+
+def _live_attempts(page: Page) -> str:
+    """What the attempts pair says, or `""` when it is not saying anything.
+
+    **Gated on the control being on show, and that is not a detail.** A hidden
+    box keeps whatever number was last in it, so reading it unguarded would let
+    a row that turns an assignment *online* "carry through" a limit the
+    assignment never had -- inventing a setting nobody typed, which is the same
+    failure as dropping one. It is also the mirror of the refusal in
+    `_write_allowed_attempts`: a hidden control's value is not the object's
+    state, in either direction.
+    """
+    found = page.evaluate(_ATTEMPTS_PROBE)
+    return _attempts_cell(found) if _attempts_operable(found) else ""
+
+
+def _attempts_cell(found: dict | None) -> str:
+    """The attempts pair's state as the sheet spells it -- `-1` for unlimited.
+
+    **One implementation of "how do these two controls become one cell".** The
+    select and the count box each hold half the answer, and the read-back gate,
+    the carry-through and any future reader all have to combine them the same
+    way. Two implementations of one question is the shape that has already cost
+    this project three bugs -- most recently a correct rename reported as
+    MISMATCH, because `verify_settings` read ENV its own way.
+
+    Returns `""` when the probe found no pair at all, which is a *question not
+    answered* rather than a value: callers decide what that means where they
+    have the context to.
+    """
+    if not found:
+        return ""
+    if found.get("select_value") == "unlimited":
+        return "-1"
+    return (found.get("box_value") or "").strip()
+
+
 #: Selecting this takes the assignment out of the gradebook entirely and hides
 #: its points and dates. Reported loudly rather than refused -- it is a real
 #: thing a person may want -- but it is not a change to make by accident.
@@ -939,7 +997,18 @@ def _write_submission_types(page: Page, assignment_id: str, value: str) -> None:
             f"the option VALUES, not the words on screen."
         )
 
-    page.locator(SUBMISSION_SELECT).select_option(mode)
+    # **Not re-selected when it is already selected.** Playwright dispatches
+    # `change` whatever the value, and the mode select is the control the rest
+    # of this form reacts to -- so a row editing only the sub-type boxes has no
+    # business firing it. Same guarantee as the checkbox loop below and as
+    # `_write_checkbox`: never operate a control that already holds the wanted
+    # state.
+    #
+    # **Discipline, not a fix**: a re-select was measured 2026-09-13 (Temple,
+    # `attempts_clear_probe.py`) and changed nothing at all, including the
+    # Allowed Attempts pair this was first written to protect.
+    if found["mode"] != mode:
+        page.locator(SUBMISSION_SELECT).select_option(mode)
 
     if mode == "online":
         # Wait for the block to exist, rather than assuming the select's change
@@ -1022,6 +1091,95 @@ def _write_allowed_attempts(page: Page, assignment_id: str, value: str) -> None:
         box.evaluate("element => element.blur()")
 
 
+def _carry_attempts(page: Page, subject: str, keep: str) -> list[Written]:
+    """Keep an attempts limit across a submission-type write, or say it went.
+
+    **A `submission_types`-only write really can lose an attempts limit**
+    (user, 2026-09-10) -- the sheet never mentioned attempts, so that is a
+    setting unset by our own write, the failure class this project refuses
+    everywhere else, arriving as a side effect rather than as a value anyone
+    typed.
+
+    **The mechanism is not what it was thought to be, measured live
+    2026-09-13** (`archives/recon-scripts/attempts_clear_probe.py`, Temple's
+    edit form). Canvas does **not** clear the box: it *hides* the pair when the
+    new mode accepts no submissions, value intact in the DOM, and then **drops
+    the limit server-side on save** -- an assignment nobody can submit to
+    cannot have one. Ticking a sub-type box, changing the mode and back, and
+    re-picking the same mode all left `limited`/`3` exactly where it was.
+
+    So on that form the live outcome is the *report* below, and the restore is
+    defence: the user's observation was of a form nobody here can experiment on
+    (UF, 101 students), and a Canvas that does clear the box is handled without
+    having to be re-diagnosed. **The restore branch is therefore UNPROVEN and
+    may be unreachable** -- which is said out loud rather than left for someone
+    to discover as dead code.
+
+    `keep` is what the form held *before* the mode was touched, read there
+    because that is the last moment it is certainly legible.
+
+    Three outcomes, and the middle one is the reason this is not a refusal:
+
+    * The new submission type has no attempts pair on show at all (Canvas hides
+      it unless the assignment accepts submissions), so nothing here can keep
+      the limit. **Reported, never refused**: refusing would be unsatisfiable,
+      because the obvious way to satisfy it -- saying `allowed_attempts=-1` in
+      the same row -- is itself refused by `_write_allowed_attempts`, for the
+      same hidden control.
+      **Canvas really does drop it, measured live 2026-09-13** on Temple's
+      TEMPLATE course: `#3590538` went from `online_text_entry` with a limit of
+      3 to `none`, and ENV came back `allowed_attempts: -1` -- while the
+      hidden box on the form still said `limited`/`3`. The loss is *Canvas's*,
+      server-side, not a cleared control. Measured once and for `none` only, so
+      the note hedges and the claim it makes is `keep`: the caller's ENV re-read
+      reports what actually happened each run, which is a measurement rather
+      than a guess, and says MISMATCH when the limit went.
+    * Canvas left the pair alone -- nothing to do, and nothing to say.
+    * The pair is there and holds something else -- put the limit back, and
+      refuse if it will not hold. Nothing has been saved yet, so refusing here
+      costs a page load and prevents the clobber.
+    """
+    # `-1` is unlimited, which is exactly what a cleared control means, so there
+    # is no state to lose. Compared as the cell it is, via `_attempts_cell`,
+    # rather than by peering at the box.
+    if not keep or keep == "-1":
+        return []
+
+    found = page.evaluate(_ATTEMPTS_PROBE)
+    # **Asked before the values are compared**, because a hidden pair holding
+    # the right number is not the same as a limit that survived: the control is
+    # not the assignment's state once Canvas has taken it off the form.
+    if not _attempts_operable(found):
+        return [Written(
+            assignment_id=subject, field="allowed_attempts",
+            wanted=keep, typed=keep, confirmed="",
+            note=(f"Canvas offers no Allowed Attempts control for this "
+                  f"submission type, so its limit of {keep} is probably "
+                  f"dropped -- the line below says what it actually did"),
+        )]
+
+    if _same_number(_attempts_cell(found), keep):
+        return []
+
+    _write_allowed_attempts(page, subject, keep)
+    page.wait_for_timeout(150)
+    got = _attempts_cell(page.evaluate(_ATTEMPTS_PROBE))
+    if not _same_number(got, keep):
+        snapshot = save_debug_snapshot(page, f"attempts-carry-{subject}")
+        raise WriteRefused(
+            f"assignment {subject}: the submission type write left Allowed "
+            f"Attempts holding something else, and putting {keep!r} back left "
+            f"the form holding {got!r}. Nothing was saved -- saving now would "
+            f"drop the limit. Snapshot: {snapshot}"
+        )
+    return [Written(
+        assignment_id=subject, field="allowed_attempts",
+        wanted=keep, typed=got, confirmed="",
+        note=(f"its limit of {keep} was carried through -- the submission "
+              f"type write had left this box holding something else"),
+    )]
+
+
 def _apply_field_values(
     page: Page, subject: str, changes: dict[str, str]
 ) -> list[Written]:
@@ -1055,9 +1213,7 @@ def _apply_field_values(
         if column == "allowed_attempts":
             _write_allowed_attempts(page, subject, value)
             page.wait_for_timeout(150)
-            landed = page.evaluate(_ATTEMPTS_PROBE)
-            got = ("-1" if landed["select_value"] == "unlimited"
-                   else (landed["box_value"] or ""))
+            got = _attempts_cell(page.evaluate(_ATTEMPTS_PROBE))
             if not _same_number(got, value):
                 snapshot = save_debug_snapshot(
                     page, f"attempts-reverted-{subject}")
@@ -1072,6 +1228,13 @@ def _apply_field_values(
             continue
 
         if column == "submission_types":
+            # **What the attempts pair holds before the mode is touched**, read
+            # here because the mode change is what destroys it. Only when the
+            # caller did not ask for attempts itself: it is written after this
+            # branch (see `order` above), so its own value wins and there is
+            # nothing to protect. See `_carry_attempts`.
+            keep = "" if "allowed_attempts" in changes else _live_attempts(page)
+
             # Its own shape: a select plus five checkboxes, so it does not fit
             # the one-selector FormField table. Same three gates all the same.
             _write_submission_types(page, subject, value)
@@ -1089,6 +1252,10 @@ def _apply_field_values(
             written.append(
                 Written(assignment_id=subject, field=column,
                         wanted=value, typed=got, confirmed=""))
+            # **After the gate, and before the caller can save.** An attempts
+            # limit the mode change dropped is put back on the form now, so the
+            # one save this path makes carries it.
+            written += _carry_attempts(page, subject, keep)
             continue
 
         field = FORM_FIELDS.get(column)

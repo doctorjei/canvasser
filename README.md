@@ -396,6 +396,24 @@ encoding, which is what the sheet carries. Canvas hides the control unless the a
 accepts submissions, so limiting attempts on a `none` submission type is refused, naming
 `submission_types` as the thing to set first.
 
+That cuts the other way too, and it is the one case where a write touches a field your
+sheet never mentioned. **Changing an assignment's submission type to `none` or `on_paper`
+takes its attempts limit with it** — Canvas has nowhere to keep a limit on something nobody
+can submit to. The limit is read before the change and reported afterwards, with what
+Canvas holds now, so a lost setting is never silent:
+
+```
+AGENT TEST  #3590538
+    submission_types  online_text_entry -> none   Canvas now: none   OK
+    allowed_attempts  Canvas offers no Allowed Attempts control for this submission
+                      type, so its limit of 3 is probably dropped -- the line below
+                      says what it actually did
+                      Canvas now: -1   MISMATCH
+```
+
+A limit that the form drops for any other reason is put back before the save, so an edit to
+one field cannot quietly unset another.
+
 `grading_type` takes the option **values**, not the words on the form: `points`, `percent`,
 `letter_grade`, `gpa_scale`, `pass_fail`, `not_graded`. Anything else is refused before a
 page is loaded, naming what is accepted:
@@ -472,7 +490,7 @@ rather than a terminal:
 |------|-------|
 | `0` | nothing to do, or the commit finished cleanly |
 | `1` | **a preview with changes pending** — not an error |
-| `2` | one or more items did not land (each reason is printed above), or the run stopped on an error such as an unreadable sheet, a refused login or a rejected write |
+| `2` | one or more items did not land (each reason is printed above), or a field the write had to give up — such as an attempts limit on a submission type that cannot hold one — or the run stopped on an error such as an unreadable sheet, a refused login or a rejected write |
 | `3` | halted part-way through creating, and the message says what state Canvas is in |
 
 **`1` is the one to be careful with.** A dry run that found work to do exits non-zero by
