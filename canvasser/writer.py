@@ -1058,10 +1058,24 @@ def _write_allowed_attempts(page: Page, assignment_id: str, value: str) -> None:
     # Writing into a hidden control is how a value gets set and then discarded
     # on save, which reads as success.
     if not found["select_visible"]:
+        # **The advice has to fit the situation, and it did not.** This said
+        # "set submission_types in the same row" -- which is exactly what a row
+        # asking for `none` or `on_paper` has just done, since the submission
+        # type is written first. The reader was told to do the thing that
+        # caused the refusal. The mode on the form at this point IS what the
+        # row asked for, so it can be named rather than guessed at.
+        mode = (page.evaluate(_SUBMISSION_PROBE, ONLINE_TYPE_BOXES)
+                or {}).get("mode") or ""
         raise WriteRefused(
-            f"assignment {assignment_id}: Canvas hides Allowed Attempts unless "
-            f"the assignment accepts submissions. Set submission_types in the "
-            f"same row (or in Canvas) before limiting attempts."
+            f"assignment {assignment_id}: Canvas offers no Allowed Attempts "
+            + (f"control for submission type {mode!r} -- an assignment nobody "
+               f"can submit to cannot have an attempts limit. Drop the "
+               f"allowed_attempts cell from this row, or give it a submission "
+               f"type that accepts submissions."
+               if mode in ("none", "on_paper") else
+               f"control here: Canvas hides it unless the assignment accepts "
+               f"submissions. Set submission_types in the same row (or in "
+               f"Canvas) before limiting attempts.")
         )
     # Labels are checked as a prefix: this one is a WRAPPING label, so its text
     # is the caption run together with the option words --
