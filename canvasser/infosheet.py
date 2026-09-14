@@ -55,15 +55,20 @@ Consequences that live in this module:
 
 ## Header
 
-Three rows, matching the datesheet's shape so a spreadsheet round-trips them
+Four rows, matching the datesheet's shape so a spreadsheet round-trips them
 and a person recognises the layout:
 
-    # canvasser infosheet v1,,course=580777,,,,,,
-    Assignment Details,,,Grading,,,Submission,,Availability
-    assignment_id,title,assignment_group,points_possible,...
+    # canvasser infosheet v1.1,,course=580777,,,,,,,,
+    Assignment Details,,,,Grading,,Submission,,Availability,,
+    ,needs --rename,read-only,read-only,,,,,false->true only,,read-only
+    assignment_id,title,kind,assignment_group,points_possible,...
 
 Row 1 records the schema version and the source course, so a file cannot be
 applied to the wrong class. **No timezone**: nothing here is a time.
+
+Row 3 says what `push` may do with each column -- see `COLUMN_MARKERS`. It is
+written for the reader and never read back; every preamble row is skipped on
+the way in, because the header is *searched for* rather than counted to.
 """
 
 from __future__ import annotations
@@ -78,7 +83,12 @@ from .datesheet import HEADER as _DATESHEET_HEADER, SheetError
 #: Bumped only when a column's *meaning* changes. Read compares major only, for
 #: the same reason the datesheet does: adding a column is backward compatible,
 #: because an absent column already means "leave this field alone".
-SCHEMA_VERSION = "1"
+#:
+#: **v1.1 added the marker row** (2026-09-14) -- a preamble row saying what
+#: `push` may do with each column. A *minor* bump on purpose: same columns,
+#: same meanings, and the version check compares major, so a v1 sheet still
+#: reads and a v1.1 sheet still reads in an older build.
+SCHEMA_VERSION = "1.1"
 
 #: Row 1, first cell. Distinct from the datesheet's marker on purpose -- this is
 #: what lets `push` tell the two files apart before it parses a single row.
@@ -228,6 +238,62 @@ def _group_row() -> list[str]:
     return cells
 
 
+#: Row 3: what `push` may do with each column (user, 2026-09-10: *"For
+#: unwritable fields, we should probably add some sort of marker."*).
+#:
+#: **Three marker words, plus blank** -- because the docs already treat these as
+#: different facts and flattening them would mislead. A column absent from this
+#: map is writable with no ceremony, which is the common case and needs no word:
+#:
+#:   `read-only`        a fact rather than a setting -- never writable by
+#:                      nature. `kind` is whichever ENV object the page
+#:                      carried; `override_count` is a count.
+#:   `needs --rename`   writable *now*, but only when asked. Calling `title`
+#:                      "not writable" would send a reader waiting for a
+#:                      feature that already exists.
+#:   `false->true only` added the day `published` graduated (2026-09-14), and
+#:                      predicted by the 2026-09-10 design, which listed
+#:                      read-only / not writable yet / needs a flag and said a
+#:                      fourth would be wanted. Canvas offers "Save & Publish"
+#:                      exactly while an assignment is unpublished and offers
+#:                      nothing at all for the other direction, so the column
+#:                      is genuinely half-writable. "read-only" would deny it
+#:                      is a setting; "not writable yet" would be wrong twice
+#:                      over -- it IS writable, and the missing direction is
+#:                      Canvas's limit rather than work outstanding.
+#:
+#: **`kind` and `assignment_group` are marked read-only despite being settable
+#: on a `NEW` row.** The exception is real (`CREATE_ONLY_COLUMNS`) and belongs
+#: in prose, not in a fourth marker on the columns' normal case: a row creating
+#: an assignment is not the row a reader is looking at when they wonder whether
+#: an edit will land.
+COLUMN_MARKERS = {
+    "kind": "read-only",
+    "assignment_group": "read-only",
+    "override_count": "read-only",
+    "title": "needs --rename",
+    "published": "false->true only",
+}
+
+
+def _marker_row() -> list[str]:
+    """Row 3. Presentational, and **never read back**.
+
+    Safe to add without touching the reader because `read_sheet` locates the
+    column header by *searching* for `assignment_id` rather than counting
+    preamble rows -- a property the format already had to guarantee, since a
+    spreadsheet may add or drop a blank line on re-save. This row carries no
+    such cell, so it cannot be mistaken for the header.
+
+    It is documentation for the person editing the file, and nothing more: the
+    authority on what `push` will write is `EDITABLE_COLUMNS` and
+    `push.WRITABLE_INFO_FIELDS`, which is why this map is not consulted
+    anywhere in the write path. A marker a user edited must not change what the
+    tool does.
+    """
+    return [COLUMN_MARKERS.get(column, "") for column in COLUMNS]
+
+
 def write_sheet(
     rows: list[InfoRow], path: Path, course_id: str | None = None
 ) -> Path:
@@ -241,6 +307,7 @@ def write_sheet(
         writer = csv.writer(handle)
         writer.writerow(_stamp_row(course_id))
         writer.writerow(_group_row())
+        writer.writerow(_marker_row())
         writer.writerow(COLUMNS)
         for row in rows:
             writer.writerow([getattr(row, column) for column in COLUMNS])

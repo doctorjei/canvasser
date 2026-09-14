@@ -312,11 +312,19 @@ uses the form's own Clear control.
 Everything about an assignment that is *not* a date:
 
 ```
-# canvasser infosheet v1,,course=580777,,,,,,,,
+# canvasser infosheet v1.1,,course=580777,,,,,,,,
 Assignment Details,,,,Grading,,Submission,,Availability,,
+,needs --rename,read-only,read-only,,,,,false->true only,,read-only
 assignment_id,title,kind,assignment_group,points_possible,grading_type,submission_types,allowed_attempts,published,peer_reviews,override_count
 7289050,01 - Equipment Demonstration,assignment,Intro Assignments,30,points,external_tool,-1,true,false,0
 ```
+
+**Row 3 says what `push` may do with each column.** A blank marker means the column is
+writable with no ceremony; the others are `read-only` (a fact rather than a setting),
+`needs --rename`, and `false->true only` for `published`, which Canvas offers a control for
+in one direction and not the other. It is written for you to read and is never read back —
+edit it, delete it, or delete the whole preamble; the header row is found by searching for
+`assignment_id`.
 
 **A separate file from the datesheet, and the reason is one rule, not two.** A date is the
 one field Canvas lets an assignment simply *not have* — so on the datesheet an empty cell
