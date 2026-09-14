@@ -154,6 +154,33 @@ ENV_PROBE = """() => {
 }"""
 
 
+class ReadRefused(Exception):
+    """A page could not be read, and recording a guess would lose data.
+
+    Every refusal in this module is of one shape: Canvas did not give us what
+    the sheet needs, and the alternatives -- an undated row, a short index --
+    are indistinguishable from a healthy result once written. So they refuse.
+
+    **Named, and caught in `cli.main`, purely so the message arrives as a
+    message.** A typo in an `assignment_id` cell used to surface as a bare
+    `RuntimeError` traceback, which tells the reader nothing they can act on
+    and reads as a crash in the tool rather than a fault in their sheet
+    (found 2026-09-14). The refusals themselves were right throughout; only
+    their presentation was wrong.
+
+    **Deliberately not a `RuntimeError` subclass**, mirroring
+    `writer.WriteRefused`. `main` catches a named list and lets everything else
+    crash loudly, because an unexpected exception IS a defect and should look
+    like one -- and `RuntimeError` is what a genuine defect raises.
+
+    **Also deliberately not caught per row by `cmd_push_info`.** That handler
+    skips a row and moves on, which is right for a write that did not happen
+    and wrong here: the reads all run *before* the diff, so nothing has been
+    written, and a sheet with a bad id is a sheet to fix rather than a run to
+    salvage. Swallowing it per row would silently narrow the push.
+    """
+
+
 @dataclass(frozen=True)
 class Assignment:
     id: str
@@ -243,7 +270,7 @@ def list_assignments(page: Page, config: Config, course_id: str) -> list[Assignm
     seen = _wait_for_list_to_settle(page)
     if not seen.settled:
         snapshot = save_debug_snapshot(page, f"assignments-unsettled-{course_id}")
-        raise RuntimeError(
+        raise ReadRefused(
             f"The assignments index for course {course_id} was still rendering "
             f"when the wait timed out ({seen.count} link(s) found and still "
             f"changing). Refusing to scrape a list in motion: the rows that had "
@@ -281,7 +308,7 @@ def list_assignments(page: Page, config: Config, course_id: str) -> list[Assignm
 
     if not found:
         snapshot = save_debug_snapshot(page, f"assignments-empty-{course_id}")
-        raise RuntimeError(
+        raise ReadRefused(
             f"No assignments found for course {course_id}. Snapshot: {snapshot}"
         )
 
@@ -373,13 +400,39 @@ def read_assignment_dates(page: Page, assignment: Assignment) -> dict:
 
     if not env.get("has_subject"):
         snapshot = save_debug_snapshot(page, f"assignment-no-subject-{assignment.id}")
-        raise RuntimeError(
+        raise ReadRefused(
             f"Neither ENV.ASSIGNMENT nor ENV.QUIZ on {page.url} for assignment "
             f"{assignment.id} ({assignment.title!r}). Refusing to record it as "
             f"undated -- an absent subject is not an absent due date. "
             f"Snapshot: {snapshot}"
         )
     return env
+
+
+def _sheet_read(page: Page, target: Assignment) -> dict:
+    """`read_assignment_dates`, with the advice a SHEET's reader needs.
+
+    Same read, different provenance for the id: here it came out of an
+    `assignment_id` cell a person typed, so the likely causes are ones the walk
+    cannot have -- a typo, an id belonging to another course, or an id that
+    names something Canvas does not mint an assignment for. `#617119`, a draft
+    classic quiz, is the measured example (2026-09-14): `/assignments/617119`
+    carries neither ENV object, so the read refuses and no sheet row can name
+    it.
+
+    `read_assignment_dates` must not say any of that itself -- it is also the
+    walk's reader, where the id came from Canvas's own index and "check your
+    sheet" would send the reader looking for a mistake they did not make.
+    """
+    try:
+        return read_assignment_dates(page, target)
+    except ReadRefused as exc:
+        raise ReadRefused(
+            f"{exc}\n\nCheck the assignment_id column of your sheet. "
+            f"{target.id} may be a typo, may belong to a different course, or "
+            f"may name something that is not an assignment -- a quiz id, for "
+            f"instance, which Canvas does not give an assignment page."
+        ) from exc
 
 
 def _date_urls(href: str) -> tuple[str, str | None]:
@@ -424,7 +477,7 @@ def _probe_at(page: Page, url: str, assignment_id: str) -> dict:
     env = page.evaluate(ENV_PROBE)
     if env is None:
         snapshot = save_debug_snapshot(page, f"assignment-no-env-{assignment_id}")
-        raise RuntimeError(
+        raise ReadRefused(
             f"No ENV state on {page.url} -- Canvas may have changed how the page "
             f"is rendered. Snapshot: {snapshot}"
         )
@@ -617,7 +670,7 @@ def read_specific(
             title=f"assignment {assignment_id}",
             url=f"{config.base_url}/courses/{course_id}/assignments/{assignment_id}",
         )
-        env = read_assignment_dates(page, target)
+        env = _sheet_read(page, target)
         course_tz = env.get("course_tz") or course_tz
         title = env.get("title") or target.title
         real_id = env.get("assignment_id") or assignment_id
@@ -686,7 +739,7 @@ def read_specific_info(
             title=f"assignment {assignment_id}",
             url=f"{config.base_url}/courses/{course_id}/assignments/{assignment_id}",
         )
-        env = read_assignment_dates(page, target)
+        env = _sheet_read(page, target)
         for group in env.get("groups") or []:
             if group.get("id"):
                 groups[group["id"]] = group.get("name") or ""

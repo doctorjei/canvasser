@@ -47,6 +47,7 @@ from .browser import (
     open_page,
 )
 from .assignments import (
+    ReadRefused,
     format_in_course_time,
     pull_course,
     read_specific,
@@ -1462,6 +1463,14 @@ def main(argv: list[str] | None = None) -> int:
         ApprovalError,
         SheetError,
         DateFormatError,
+        # A page that would not yield what the sheet needs. Every one of these
+        # refusals is correct and already carries an actionable message -- an
+        # id to check, a pull to re-run -- and until 2026-09-14 they all landed
+        # as tracebacks, so a typo in an `assignment_id` cell read as a crash.
+        # Caught HERE rather than per row in `cmd_push_info`: the reads all run
+        # before the diff, so nothing has been written, and a sheet with a bad
+        # id wants fixing rather than pushing without that row.
+        ReadRefused,
     ) as exc:
         print(f"\nERROR: {exc}", file=sys.stderr)
         return 2
