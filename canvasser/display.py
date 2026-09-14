@@ -463,7 +463,7 @@ GAP = "  "
 BOLD_UNDERLINE_WHITE = BOLD_WHITE_U
 
 
-def render_diff(diff, sheet) -> list[str]:
+def render_diff(diff, sheet, committing: bool = False) -> list[str]:
     """What a push would change. Loud about anything destructive.
 
     Clearing a date gets the red treatment that publish state gets in the
@@ -471,7 +471,11 @@ def render_diff(diff, sheet) -> list[str]:
     open-ended for every student in the course, and it is the edit most likely
     to be an accident (an emptied spreadsheet cell looks like nothing at all).
     """
-    out = [_paint(fit("Push preview -- nothing has been written", 79), BOLD_WHITE_U), ""]
+    # See `render_creates`: under `--commit` the write output appears beneath
+    # this heading, so the heading must not describe the run as a preview.
+    out = [_paint(fit("Push -- these changes WILL be written" if committing
+                      else "Push preview -- nothing has been written", 79),
+                  BOLD_WHITE_U), ""]
 
     if diff.is_empty:
         out.append(_paint("  No changes. ", BOLD_GREEN)
@@ -523,7 +527,7 @@ def render_diff(diff, sheet) -> list[str]:
     return out
 
 
-def render_creates(plans, refusals) -> list[str]:
+def render_creates(plans, refusals, committing: bool = False) -> list[str]:
     """What an infosheet push would CREATE, and which rows it will not.
 
     Rendered separately from the diff rather than folded into it, because a
@@ -539,7 +543,14 @@ def render_creates(plans, refusals) -> list[str]:
     if not plans and not refusals:
         return []
 
-    out = [_paint(fit("New assignments -- nothing has been created", 79),
+    # **The header has to know which run this is.** It read "nothing has been
+    # created" under `--commit` too, directly above the lines reporting a
+    # successful creation -- true at the instant it printed and false by the
+    # time anyone read it, in the one section a person scans to find out what
+    # just happened. `committing` is passed rather than inferred because
+    # nothing in a plan says whether it is about to be acted on.
+    out = [_paint(fit("New assignments -- these WILL be created" if committing
+                      else "New assignments -- nothing has been created", 79),
                   BOLD_WHITE_U), ""]
 
     for plan in plans:
@@ -596,7 +607,7 @@ def render_creates(plans, refusals) -> list[str]:
     return out
 
 
-def render_info_diff(diff) -> list[str]:
+def render_info_diff(diff, committing: bool = False) -> list[str]:
     """What an infosheet push would change.
 
     Two things get loud treatment, for the same reason publish state does in
@@ -608,7 +619,11 @@ def render_info_diff(diff) -> list[str]:
     * **an edit to a column this build cannot write**, which would otherwise be
       a silent no-op the user reads as success.
     """
-    out = [_paint(fit("Info push preview -- nothing has been written", 79),
+    # Same reason as `render_creates`: the write results are printed under this
+    # heading, so "nothing has been written" is a claim about the moment it
+    # renders and a falsehood about the screen it sits on.
+    out = [_paint(fit("Info push -- these changes WILL be written" if committing
+                      else "Info push preview -- nothing has been written", 79),
                   BOLD_WHITE_U), ""]
 
     if (diff.is_empty and not diff.has_unsupported and not diff.has_invalid

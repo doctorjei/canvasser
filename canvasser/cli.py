@@ -790,10 +790,10 @@ def cmd_push_info(args: argparse.Namespace, sheet_path: Path) -> int:
         print()
         # Creates first: they are the irreversible half, and reading them
         # before a list of edits puts the consequential thing at the top.
-        create_lines = render_creates(creates, refused_creates)
+        create_lines = render_creates(creates, refused_creates, args.commit)
         if create_lines:
             print("\n".join(create_lines))
-        print("\n".join(render_info_diff(diff)))
+        print("\n".join(render_info_diff(diff, args.commit)))
 
         nothing_to_do = diff.is_empty and not creates
         if not args.commit:
@@ -1017,7 +1017,7 @@ def cmd_push(args: argparse.Namespace) -> int:
 
     diff = compare(sheet, current)
     print()
-    print("\n".join(render_diff(diff, sheet)))
+    print("\n".join(render_diff(diff, sheet, args.commit)))
 
     # Rows Canvas will reject on sight. Reported with the diff so they are
     # visible in a dry run, and skipped at commit rather than costing an edit
