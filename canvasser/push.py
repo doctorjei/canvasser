@@ -590,11 +590,23 @@ ONLINE_SUBMISSION_TYPES = (
     "student_annotation",
 )
 
+#: The two modes that accept no submissions at all. **Named once**, because
+#: three separate spellings of this pair had grown up -- the exclusivity check
+#: below, `writer._write_allowed_attempts`' refusal message, and now the
+#: attempts-loss warning -- and "two implementations of one question" is the
+#: shape that has already cost this project three bugs.
+#:
+#: What makes them a pair rather than two values: **Canvas drops an assignment's
+#: attempts limit, server-side, when it is saved in either of them** (measured
+#: on `none` 2026-09-13 and on `on_paper` 2026-09-14; ENV came back `-1` both
+#: times). An assignment nobody can submit to cannot have an attempts limit.
+NO_SUBMISSION_MODES = ("none", "on_paper")
+
 #: Expressible in the sheet and writable. `online` is absent deliberately: ENV
 #: reports the chosen sub-types, never the bare mode, so a cell reading
 #: `online` would describe a state Canvas cannot be left in -- picking Online
 #: with no box ticked is not a thing the form saves.
-WRITABLE_SUBMISSION_TYPES = ("none", "on_paper") + ONLINE_SUBMISSION_TYPES
+WRITABLE_SUBMISSION_TYPES = NO_SUBMISSION_MODES + ONLINE_SUBMISSION_TYPES
 
 #: **Refused, and not for lack of a control.** Selecting External Tool requires
 #: a tool URL, and the infosheet has no column carrying one -- so a write would
@@ -645,7 +657,7 @@ def check_submission_types(cell: str) -> str | None:
     # `none` and `on_paper` are whole states, not ingredients. Combining either
     # with anything describes an assignment Canvas cannot be in, and picking a
     # winner would be a guess about which half the user meant.
-    exclusive = sorted(wanted & {"none", "on_paper"})
+    exclusive = sorted(wanted & set(NO_SUBMISSION_MODES))
     if exclusive and len(wanted) > 1:
         return (f"submission_types={cell!r} combines {exclusive[0]!r} with "
                 f"other types. It is a complete state on its own")
@@ -685,6 +697,53 @@ def check_grading_type(cell: str) -> str | None:
                 f"{', '.join(GRADING_TYPES)} (these are the option values, "
                 f"not the words shown on the form)")
     return None
+
+
+@dataclass(frozen=True)
+class AttemptsLoss:
+    """An attempts limit this row's submission-type change is about to cost.
+
+    Structured rather than a pre-rendered sentence, so `display` owns the
+    wording and an offline check can assert the *rendered* line -- which is the
+    only assertion that would have caught publish-at-create's silent preview.
+    """
+
+    #: What Canvas holds today, as the sheet spells it: `3`, never `-1`.
+    #: Unlimited has nothing to lose, so it never produces one of these.
+    limit: str
+    #: The no-submission mode the row is asking for -- `none` or `on_paper`.
+    mode: str
+
+
+def attempts_at_risk(live_attempts: str, wanted_types: str) -> AttemptsLoss | None:
+    """The limit a submission-type change will cost, or None.
+
+    **Fully computable at diff time**, which is the point: the row's new
+    `submission_types` and the live `allowed_attempts` are both already in
+    hand. Until now the loss was only reported at commit, by
+    `writer._carry_attempts` -- honest, but after the fact, and this project's
+    own rule is that the preview is where a decision gets made.
+
+    Not a guess. Saving an assignment in either no-submission mode drops its
+    limit server-side, measured in both (`NO_SUBMISSION_MODES`). The form is
+    innocent throughout -- it hides the pair while keeping the value -- so no
+    DOM read-back could have predicted this and nothing but the measurement
+    could have established it.
+    """
+    if (wanted_types or "").strip().lower() not in NO_SUBMISSION_MODES:
+        return None
+    # A spreadsheet writes `3.0` for `3`; `same_attempts` tolerates that, so
+    # this must too rather than reporting no risk on a formatting difference.
+    try:
+        limit = int(float((live_attempts or "").strip()))
+    except (TypeError, ValueError):
+        return None
+    # `-1` is Canvas's encoding for unlimited and there is nothing to lose;
+    # a blank is a quiz row, which carries no attempts control at all.
+    if limit <= 0:
+        return None
+    return AttemptsLoss(limit=str(limit),
+                        mode=(wanted_types or "").strip().lower())
 
 
 @dataclass(frozen=True)
@@ -734,6 +793,14 @@ class InfoRowDiff:
     #: **Only `false -> true`.** `true -> false` has no control anywhere, so it
     #: stays in `unsupported` and is reported rather than guessed at.
     publish: bool = False
+    #: Set when this row's `submission_types` change will cost an attempts
+    #: limit the sheet never mentioned. Its own field rather than a `changes`
+    #: entry for the same reason `publish` is one: nothing is being written to
+    #: an `allowed_attempts` control -- Canvas simply drops what the new mode
+    #: cannot represent -- so a `{column: value}` entry would send the write
+    #: path hunting for a widget, and the field count would claim an edit
+    #: nobody asked for.
+    attempts_loss: AttemptsLoss | None = None
 
 
 @dataclass(frozen=True)
@@ -782,6 +849,16 @@ class InfoDiff:
         button click, so folding the two together would make that untrue.
         """
         return sum(1 for row in self.changed if row.publish)
+
+    @property
+    def attempts_loss_count(self) -> int:
+        """How many rows would lose an attempts limit as a side effect.
+
+        Counted apart from `field_count` for the same reason `publish_count`
+        is: nothing is written to an `allowed_attempts` control, so calling it
+        a changed field would make "N field(s) would change" untrue.
+        """
+        return sum(1 for row in self.changed if row.attempts_loss)
 
 
 def same_points(before: str, after: str) -> bool:
@@ -1148,6 +1225,19 @@ def compare_info(
             else:
                 unsupported.append(change)
 
+        # **Only when the row does not name `allowed_attempts` itself**, which
+        # is `writer._carry_attempts`' own gate, restated at diff time so the
+        # two cannot describe different situations. A row that does name it is
+        # not a silent loss: attempts are written after the submission type, so
+        # its own value wins where the control still exists and the write is
+        # refused where it does not.
+        asked_attempts = any(c.field == "allowed_attempts" for c in changes)
+        loss = None
+        if not asked_attempts:
+            for change in changes:
+                if change.field == "submission_types":
+                    loss = attempts_at_risk(have.allowed_attempts, change.after)
+
         if changes or unsupported or gated or invalid or publish:
             changed.append(
                 InfoRowDiff(
@@ -1165,6 +1255,7 @@ def compare_info(
                     # own `kind` cell is read-only and may say anything.
                     kind=have.kind,
                     publish=publish,
+                    attempts_loss=loss,
                 )
             )
 

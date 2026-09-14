@@ -668,6 +668,21 @@ def render_info_diff(diff, committing: bool = False) -> list[str]:
                 out.append(_paint(
                     "        its points re-scales every student's percentage",
                     BRIGHT_BOLD_RED))
+        if row.attempts_loss:
+            # **Said BEFORE the write, not only after it.** The loss was
+            # already reported at commit time by `writer._carry_attempts`,
+            # which is honest and too late: this project's own rule is that
+            # the preview is where a decision gets made, and the field it
+            # costs is one the sheet never mentioned. Like `publish`, it is
+            # not in `row.changes`, so the loop above cannot see it -- the
+            # same blind spot, and so the same explicit line.
+            loss = row.attempts_loss
+            out.append(_paint(
+                f"      ^ ATTEMPTS LIMIT WILL BE LOST -- submission type "
+                f"{loss.mode!r} accepts no", BRIGHT_BOLD_RED))
+            out.append(_paint(
+                f"        submissions, so Canvas drops this assignment's "
+                f"limit of {loss.limit} on save", BRIGHT_BOLD_RED))
         if row.publish:
             # **`publish` is not in `row.changes` and must still be shown.** It
             # is a button rather than a field, so the loop above cannot see it
@@ -743,6 +758,11 @@ def render_info_diff(diff, committing: bool = False) -> list[str]:
         + (_paint(f"; {invalid} cell(s) SKIPPED as invalid", BRIGHT_BOLD_RED)
            if invalid else "")
         + (_paint(f"; {graded} already graded", BRIGHT_BOLD_RED) if graded else "")
+        # Counted apart from the fields, like the publish count above and for
+        # the same reason -- no `allowed_attempts` control is written, since
+        # Canvas simply drops what the new submission type cannot hold.
+        + (_paint(f"; {diff.attempts_loss_count} would LOSE an attempts limit",
+                  BRIGHT_BOLD_RED) if diff.attempts_loss_count else "")
     )
     return out
 

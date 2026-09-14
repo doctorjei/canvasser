@@ -86,7 +86,7 @@ from .dateparse import DateFormatError, resolve, zone_of
 # and the one on the write path is the one that decides what a real setting is
 # left as -- the lesson `verify_settings` learned by formatting a value its own
 # way. `push` does not import `writer`, so this direction carries no cycle.
-from .push import parse_flag
+from .push import NO_SUBMISSION_MODES, parse_flag
 
 #: Labels Canvas gives the three date fields. Stable and meaningful, unlike the
 #: React ids beside them (`Selectable___1`, `Select___2`) which are render-order
@@ -971,7 +971,7 @@ def _write_submission_types(page: Page, assignment_id: str, value: str) -> None:
     at blind or after a fixed sleep -- the mistake `FORM_READY` exists for.
     """
     wanted = sorted(p.strip() for p in value.split(",") if p.strip())
-    mode = wanted[0] if wanted and wanted[0] in ("none", "on_paper") else "online"
+    mode = wanted[0] if wanted and wanted[0] in NO_SUBMISSION_MODES else "online"
 
     found = page.evaluate(_SUBMISSION_PROBE, ONLINE_TYPE_BOXES)
     if not found:
@@ -1072,7 +1072,7 @@ def _write_allowed_attempts(page: Page, assignment_id: str, value: str) -> None:
                f"can submit to cannot have an attempts limit. Drop the "
                f"allowed_attempts cell from this row, or give it a submission "
                f"type that accepts submissions."
-               if mode in ("none", "on_paper") else
+               if mode in NO_SUBMISSION_MODES else
                f"control here: Canvas hides it unless the assignment accepts "
                f"submissions. Set submission_types in the same row (or in "
                f"Canvas) before limiting attempts.")
