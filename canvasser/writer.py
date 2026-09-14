@@ -1028,12 +1028,16 @@ def _write_submission_types(page: Page, assignment_id: str, value: str) -> None:
                 box.set_checked(should)
 
 
-def _write_allowed_attempts(page: Page, assignment_id: str, value: str) -> None:
+def _write_allowed_attempts(page: Page, assignment_id: str, value: str) -> str:
     """Set Unlimited/Limited and, when limited, the count.
 
     `-1` is Canvas's own encoding for unlimited and is what the sheet carries,
     so it maps to the *select*, not to the number box -- typing `-1` into a
     count box would be writing a value the control does not mean.
+
+    Returns a **note** when the write was deliberately not made, and `""` when
+    it was. The one case that returns a note is `-1` against a hidden pair: see
+    the `select_visible` branch below.
     """
     wanted = int(float(value.strip()))
     mode = "unlimited" if wanted == -1 else "limited"
@@ -1066,6 +1070,23 @@ def _write_allowed_attempts(page: Page, assignment_id: str, value: str) -> None:
         # row asked for, so it can be named rather than guessed at.
         mode = (page.evaluate(_SUBMISSION_PROBE, ONLINE_TYPE_BOXES)
                 or {}).get("mode") or ""
+        # **`-1` against a no-submission mode is a WARNING and a no-op, not a
+        # refusal** (user's call, 2026-09-14). Canvas stores `-1` for an
+        # assignment nobody can submit to, so the row is asking for the state
+        # the save produces anyway: there is nothing to write and nothing
+        # wrong. Refusing it was unsatisfiable in a way the reader could not
+        # act on -- the obvious fix, dropping the cell, is the same no-op, and
+        # the other obvious fix, a real limit, is refused below for a reason
+        # that genuinely stands.
+        #
+        # Gated on BOTH halves. A pair hidden while the mode still accepts
+        # submissions is a form nobody has explained, and what Canvas would
+        # store there has never been measured -- so that keeps refusing rather
+        # than reporting a success on a guess.
+        if wanted == -1 and mode in NO_SUBMISSION_MODES:
+            return (f"not written: Canvas offers no Allowed Attempts control "
+                    f"for submission type {mode!r}, and stores -1 for it "
+                    f"anyway -- which is what this row asked for")
         raise WriteRefused(
             f"assignment {assignment_id}: Canvas offers no Allowed Attempts "
             + (f"control for submission type {mode!r} -- an assignment nobody "
@@ -1103,6 +1124,7 @@ def _write_allowed_attempts(page: Page, assignment_id: str, value: str) -> None:
         # Enter is never pressed on this form: it submits rather than
         # committing the field (proved live 2026-08-22).
         box.evaluate("element => element.blur()")
+    return ""
 
 
 def _carry_attempts(page: Page, subject: str, keep: str) -> list[Written]:
@@ -1225,7 +1247,24 @@ def _apply_field_values(
     order = {"submission_types": 0, "allowed_attempts": 1}
     for column, value in sorted(changes.items(), key=lambda kv: order.get(kv[0], 0)):
         if column == "allowed_attempts":
-            _write_allowed_attempts(page, subject, value)
+            skipped = _write_allowed_attempts(page, subject, value)
+            if skipped:
+                # **The read-back gate is skipped with it, and must be.** The
+                # pair is hidden, and a hidden pair keeps whatever was last in
+                # it -- so reading it back would compare a stale `3` against
+                # the `-1` that was deliberately not typed, and refuse. A
+                # hidden control's value is not the object's state, which is
+                # the same rule `_live_attempts` is gated on.
+                #
+                # `typed` is the value the row asked for, so the post-write
+                # ENV re-read judges the outcome rather than this branch: if
+                # Canvas ever stopped storing -1 here, the report says
+                # MISMATCH and the run exits 2 instead of claiming a success.
+                written.append(
+                    Written(assignment_id=subject, field=column,
+                            wanted=value, typed=value, confirmed="",
+                            note=skipped))
+                continue
             page.wait_for_timeout(150)
             got = _attempts_cell(page.evaluate(_ATTEMPTS_PROBE))
             if not _same_number(got, value):

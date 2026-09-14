@@ -685,11 +685,20 @@ def _commit_creates(page, config, course_id: str, sheet_path: Path, plans):
 
 
 def side_effects(written: Sequence[Written]) -> list[Written]:
-    """The fields a write touched that nobody asked it to touch.
+    """The fields the writer has something to say about beyond "it landed".
 
-    A `note` is the writer's own sentence about why a field it was never given
-    got involved -- today only `writer._carry_attempts`, about an attempts
-    limit a submission-type change either carried or could not keep.
+    A `note` is the writer's own sentence, because it is the only layer with
+    the context to explain itself. Two things produce one today, and they are
+    opposite halves of the same situation:
+
+    * `writer._carry_attempts` -- a field **nobody asked for** was touched, or
+      could not be kept, because a submission-type change took it away;
+    * `writer._write_allowed_attempts` -- a field that **was** asked for was
+      deliberately not written, because Canvas offers no control for it and
+      stores the requested value anyway.
+
+    Either way the report below adds what ENV holds afterwards, so the note is
+    never the last word on whether the row came out right.
     """
     return [w for w in written if w.note]
 
