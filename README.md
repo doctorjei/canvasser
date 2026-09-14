@@ -22,9 +22,10 @@ automation is the better-supported path for this institution.
 > **Assignment settings** — points, grading type, submission types, allowed attempts, peer
 > review, publish state — are pulled to a second CSV. Writing them is newer than the date
 > path: points, grading type, submission types, allowed attempts and peer review can be
-> written, and a title with `--rename`. **Publish state can be set only on a brand-new
-> assignment**, not changed on one that already exists. Anything not writable is reported
-> rather than silently ignored.
+> written, and a title with `--rename`. **Publish state can be turned on** — on a brand-new
+> assignment or one that already exists — but **not off**: Canvas offers a "Save & Publish"
+> button precisely while an assignment is unpublished, and no control at all for the other
+> direction. Anything not writable is reported rather than silently ignored.
 >
 > **New assignments** can be created from the settings sheet: put `NEW` in the id cell and
 > the id Canvas assigns is written straight back into it, so the row becomes an ordinary
@@ -54,6 +55,7 @@ canvasser push dates-580777.csv       # show what would change; writes nothing
 canvasser push dates-580777.csv --commit   # actually write it
 canvasser push info-580777.csv --commit    # settings, and any NEW rows
 canvasser push info-580777.csv --rename    # also allow title changes (still needs --commit)
+canvasser push info-580777.csv --only 7289071   # just that row; repeat --only for more
 canvasser install-browser             # fetch Chromium up front (usually automatic)
 canvasser --institution templeu status     # a different Canvas, with its own session
 canvasser --institution ucf --passwordless login   # no password: approve in your app
@@ -392,6 +394,23 @@ remains the only flag that writes. The gate is deliberate: the title is also the
 read to find your row, so an edit made to keep the sheet legible should not quietly rename
 what students see. Nothing is retargeted either way — rows are matched on `assignment_id`,
 so a renamed cell still writes to its own row.
+
+**`--only` narrows a push to the rows you name**, which matters because `push` loads one
+page per row and a full sheet can be fifty of them:
+
+    canvasser push info-169156.csv --only 3590538
+    canvasser push info-169156.csv --only 3590538 --only 3591457 --commit
+
+It narrows the sheet *before* reading, so a one-row check costs one page load instead of
+fifty. Points to know:
+
+- It matches `assignment_id`. On the datesheet that brings a row's override cards with it —
+  they are saved together, so they are selected together.
+- **A narrowed run creates nothing.** `--only` names ids that already exist, so it cannot
+  select a `NEW` row, and `--only NEW` is refused rather than treated as "all the new ones".
+  The run tells you how many new rows it set aside.
+- An id the sheet does not carry is refused by name, before anything is read or written.
+- It is a selector, not a permission: it implies neither `--commit` nor `--rename`.
 
 Length is not pre-checked. Canvas's quiz form declares a 254-character limit and its
 assignment form declares none, so the limit that applies is read off the form itself: an

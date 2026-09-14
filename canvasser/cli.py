@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 
@@ -58,7 +59,9 @@ from .dateparse import DateFormatError
 from .datesheet import SheetError, read_sheet, write_sheet
 from .infosheet import (
     DATES as SHEET_DATES,
+    InfoSheet,
     NEW as SHEET_NEW,
+    is_new,
     WriteBackFailed,
     claim_new_row,
     find_lock,
@@ -298,6 +301,61 @@ def chosen_displays(args: argparse.Namespace) -> list[str]:
     """
     chosen = [name for name, _ in DISPLAYS if getattr(args, name, False)]
     return chosen or [name for name, _ in DISPLAYS]
+
+
+def narrow_rows(rows: Sequence, only: Sequence[str] | None) -> list:
+    """The rows `--only` names, or all of them when it names none.
+
+    **`push` still reads exactly what it is about to compare** -- the standing
+    rule is unchanged, and this narrows the sheet *before* the read rather than
+    filtering results afterwards. That is the whole value of the flag: checking
+    one row of a 51-row sheet cost a 51-page walk (~80s) to learn one thing.
+
+    Pure, and out here rather than inline in either `cmd_push`, for the reason
+    `chosen_displays` is: those functions need a browser and a live course, so
+    nothing offline can otherwise see what they decide -- and `chosen_displays`
+    is the standing proof that an unwatched decision drifts.
+
+    Matches on `assignment_id` alone, which is the granularity both sheets
+    share. On the datesheet that takes a base row **and every override row
+    belonging to it**; splitting those would hand the write path a partial set
+    of date cards, which is the hazard the override refusal exists for.
+
+    **A `NEW` row is never selected**, and cannot be: it names no id. So a
+    narrowed run creates nothing, which is the safe reading of "only this one"
+    -- creation is the single irreversible thing here, and a create nobody
+    asked for during a run they narrowed on purpose would be the worst possible
+    surprise. The caller says so out loud rather than leaving it inferred.
+
+    An id the sheet does not carry is refused, naming it. The alternatives are
+    both bad: pushing nothing looks like a course already in sync, and pushing
+    everything ignores the flag on the run where someone was being careful.
+    """
+    if not only:
+        return list(rows)
+    wanted = {value.strip() for value in only if value.strip()}
+    # **`NEW` is refused as a selector**, though it would otherwise match: it
+    # is the literal content of those id cells, so `--only NEW` would select
+    # *every* new row at once -- "only this one" meaning "all of the
+    # irreversible ones". Refusing keeps the invariant absolute rather than
+    # nearly true, and an invariant with an exception in it is not one.
+    if any(is_new(value) for value in wanted):
+        raise SheetError(
+            f"--only cannot name {SHEET_NEW}. It is a marker rather than an "
+            f"id, so it would select every new row at once -- and creating is "
+            f"the one thing here with no undo. Re-run without --only to "
+            f"create, or narrow to the ids of rows that already exist."
+        )
+    present = {getattr(row, "assignment_id", "") for row in rows}
+    missing = sorted(wanted - present)
+    if missing:
+        raise SheetError(
+            f"--only names {', '.join(missing)}, which the sheet does not "
+            f"carry. Nothing was read and nothing was written. Check the id "
+            f"against the sheet's assignment_id column -- `--only` selects "
+            f"rows that are already there and cannot add one."
+        )
+    return [row for row in rows if getattr(row, "assignment_id", "") in wanted]
 
 
 def cmd_settings(args: argparse.Namespace) -> int:
@@ -739,6 +797,39 @@ def side_effect_report(
     return report
 
 
+def _narrow_info_sheet(sheet: InfoSheet, only) -> tuple[InfoSheet, int, int]:
+    """Apply `--only` to an infosheet, keeping `lines` parallel to `rows`.
+
+    **The parallel arrays are the reason this is not a one-liner.**
+    `InfoSheet.lines` records which file line each row came from, and
+    `claim_new_row` writes a created assignment's id back to exactly that line.
+    Filtering `rows` and leaving `lines` alone would put a real id on whatever
+    row now sits at that index -- the failure `lines` exists to prevent,
+    introduced by the thing meant to make a run safer.
+
+    In practice a narrowed run creates nothing (`--only` cannot name a `NEW`
+    row), so the write-back never fires. That is an argument for keeping them
+    in step anyway, not against: an invariant with an exception in it is not
+    one, and the next reader should not have to re-derive why it held.
+    """
+    if not only:
+        return sheet, 0, 0
+    kept = narrow_rows(sheet.rows, only)
+    # Identity, not equality: `InfoRow` is a frozen dataclass, so two rows with
+    # the same cells compare equal, and an `in kept` test would keep both lines
+    # for one row. `narrow_rows` hands back the very objects it was given.
+    keep = {id(row) for row in kept}
+    lines = tuple(line for line, row in zip(sheet.lines, sheet.rows)
+                  if id(row) in keep)
+    dropped = len(sheet.rows) - len(kept)
+    # Counted separately because it is the consequence worth saying out loud:
+    # everything else `--only` sets aside is an edit that can be re-run, and
+    # this one is an assignment that does not get made.
+    set_aside_new = sum(1 for row in sheet.rows
+                        if row.is_new and id(row) not in keep)
+    return replace(sheet, rows=kept, lines=lines), dropped, set_aside_new
+
+
 def cmd_push_info(args: argparse.Namespace, sheet_path: Path) -> int:
     """Compare an edited infosheet against the live course, and optionally write.
 
@@ -754,6 +845,7 @@ def cmd_push_info(args: argparse.Namespace, sheet_path: Path) -> int:
     meeting.
     """
     sheet = read_info_sheet(sheet_path)
+    sheet, narrowed, set_aside_new = _narrow_info_sheet(sheet, args.only)
     # Planned before the browser is opened: every reason a `NEW` row cannot be
     # created is knowable from the sheet alone, so a bad row is named without
     # spending a login on it.
@@ -773,6 +865,18 @@ def cmd_push_info(args: argparse.Namespace, sheet_path: Path) -> int:
         + ("" if args.rename else "  (title needs --rename)"),
         file=sys.stderr,
     )
+    if args.only:
+        print(f"  --only: {len(sheet.rows)} row(s) kept, {narrowed} set aside",
+              file=sys.stderr)
+        # **Said loudly, because silence here would be the worst kind.**
+        # `--only` names existing ids, so it cannot select a `NEW` row -- a
+        # narrowed run therefore declines to create, and creation is the one
+        # irreversible thing this tool does. A reader who narrowed to check one
+        # edit must not have to deduce from an absence why their new
+        # assignment never appeared.
+        if set_aside_new:
+            print(f"           {set_aside_new} NEW row(s) will NOT be created "
+                  f"by a narrowed run; re-run without --only", file=sys.stderr)
     if creates or refused_creates:
         print(f"  New rows: {len(creates)} to create, "
               f"{len(refused_creates)} refused", file=sys.stderr)
@@ -1009,6 +1113,17 @@ def cmd_push(args: argparse.Namespace) -> int:
     if kind == SHEET_INFO:
         return cmd_push_info(args, sheet_path)
     sheet = read_sheet(sheet_path)
+    if args.only:
+        # **Selects by assignment_id, so a base row brings its override rows
+        # with it.** Splitting those would hand the write path a partial set of
+        # date cards, and saving the edit form submits every card -- the exact
+        # hazard the override refusal exists for, reached through a convenience
+        # flag.
+        narrowed_rows = narrow_rows(sheet.rows, args.only)
+        print(f"  --only: {len(narrowed_rows)} row(s) kept, "
+              f"{len(sheet.rows) - len(narrowed_rows)} set aside",
+              file=sys.stderr)
+        sheet = replace(sheet, rows=narrowed_rows)
     print(
         f"  Sheet: {sheet_path}  (v{sheet.version or '?'}, "
         f"course={sheet.course_id or '?'}, {len(sheet.rows)} row(s))\n"
@@ -1443,6 +1558,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--rename", action="store_true",
         help="allow title changes to be written (infosheet only; still needs "
              "--commit to write anything)",
+    )
+    # **Repeatable rather than comma-separated.** One mechanism, and no
+    # question about what a stray space or an empty element between commas
+    # means -- the same reasoning that keeps `--institution` a single value.
+    # It narrows what is READ, not what is reported afterwards: checking one
+    # row of a 51-row sheet cost a 51-page walk before this existed.
+    push.add_argument(
+        "--only", action="append", metavar="ID",
+        help="push only the row(s) with these assignment_id values; repeat "
+             "for several. Cannot name a NEW row, so a narrowed run creates "
+             "nothing",
     )
     return parser
 
