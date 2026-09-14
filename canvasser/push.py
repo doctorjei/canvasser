@@ -721,6 +721,19 @@ class InfoRowDiff:
     #: `#quiz_title` on a page that has `#assignment_name`. The live page is the
     #: authority about what the thing is, exactly as it is for `title` itself.
     kind: str = ""
+    #: True when this row asks an **unpublished** assignment to be published.
+    #:
+    #: **Its own field rather than an entry in `changes`, for the same reason
+    #: `CreatePlan.publish` is** (built 2026-09-14, to the user's 2026-09-11
+    #: decision): `published` is not a control on the form. Canvas offers a
+    #: second submit button, "Save & Publish", exactly while an assignment is
+    #: unpublished -- so publishing is a different *mechanism*, and a
+    #: `{column: value}` entry would send `_apply_field_values` hunting for a
+    #: widget that does not exist.
+    #:
+    #: **Only `false -> true`.** `true -> false` has no control anywhere, so it
+    #: stays in `unsupported` and is reported rather than guessed at.
+    publish: bool = False
 
 
 @dataclass(frozen=True)
@@ -736,8 +749,13 @@ class InfoDiff:
 
         Rows whose only edits are unsupported do NOT count as writable -- but
         they are still reported. See `has_unsupported`.
+
+        **A row that only asks to publish is NOT empty**, even though it
+        contributes no `changes`: publishing is a save like any other, and
+        reading this as "nothing to commit" would report a healthy request as
+        having nothing to do -- the silent no-op this project refuses.
         """
-        return not any(row.changes for row in self.changed)
+        return not any(row.changes or row.publish for row in self.changed)
 
     @property
     def has_unsupported(self) -> bool:
@@ -754,6 +772,16 @@ class InfoDiff:
     @property
     def field_count(self) -> int:
         return sum(len(row.changes) for row in self.changed)
+
+    @property
+    def publish_count(self) -> int:
+        """How many rows ask to be published.
+
+        Counted separately from `field_count` because publishing is not a
+        field: the summary says "N field(s) would change" and this one is a
+        button click, so folding the two together would make that untrue.
+        """
+        return sum(1 for row in self.changed if row.publish)
 
 
 def same_points(before: str, after: str) -> bool:
@@ -1073,6 +1101,7 @@ def compare_info(
         unsupported: list[FieldChange] = []
         gated: list[FieldChange] = []
         invalid: list[str] = []
+        publish = False
         for column in INFO_EDITABLE:
             if not sheet.specifies(column):
                 continue
@@ -1096,6 +1125,18 @@ def compare_info(
                 if reason:
                     invalid.append(reason)
                     continue
+            # **`published` is a button, not a field, so it never joins
+            # `changes`.** `false -> true` is writable (Canvas offers "Save &
+            # Publish" precisely while an assignment is unpublished) and rides
+            # on its own flag; `true -> false` has no control anywhere and is
+            # reported as not-writable rather than guessed at. The value was
+            # already validated by `INFO_CELL_CHECKS`, so it parses.
+            if column == "published":
+                if parse_flag(after):
+                    publish = True
+                else:
+                    unsupported.append(change)
+                continue
             if column in RENAME_GATED and not allow_rename:
                 # Writable, but not without being asked. Reported so the run
                 # says what it declined to do and how to ask for it -- silence
@@ -1107,7 +1148,7 @@ def compare_info(
             else:
                 unsupported.append(change)
 
-        if changes or unsupported or gated or invalid:
+        if changes or unsupported or gated or invalid or publish:
             changed.append(
                 InfoRowDiff(
                     assignment_id=wanted.key,
@@ -1123,6 +1164,7 @@ def compare_info(
                     # From the live row, like the title above it: the sheet's
                     # own `kind` cell is read-only and may say anything.
                     kind=have.kind,
+                    publish=publish,
                 )
             )
 

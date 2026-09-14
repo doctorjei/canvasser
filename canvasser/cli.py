@@ -753,7 +753,13 @@ def cmd_push_info(args: argparse.Namespace, sheet_path: Path) -> int:
         f"course={sheet.course_id or '?'}, {len(sheet.rows)} row(s))\n"
         f"  Sheet can change: "
         f"{', '.join(sheet.editable_present) or 'nothing -- no editable column'}\n"
-        f"  This build can write: {', '.join(WRITABLE_INFO_FIELDS)}"
+        # `published` is named here even though it is not in
+        # `WRITABLE_INFO_FIELDS` -- it cannot be, because that tuple feeds the
+        # map of values typed into controls and publishing is a button. Left
+        # out, this line would tell the reader the one field they can see
+        # change on a student's screen is not writable at all.
+        f"  This build can write: {', '.join(WRITABLE_INFO_FIELDS)}, "
+        f"published (false -> true only)"
         + ("" if args.rename else "  (title needs --rename)"),
         file=sys.stderr,
     )
@@ -838,7 +844,10 @@ def cmd_push_info(args: argparse.Namespace, sheet_path: Path) -> int:
         print()
         problems: list[str] = list(create_problems)
         for row in diff.changed:
-            if not row.changes:
+            # **A row may have nothing but a publish request**, which is a real
+            # save with no field in it. Reading `changes` alone here would skip
+            # it silently -- the no-op that looks like success.
+            if not row.changes and not row.publish:
                 continue
             # Every field for one assignment goes in ONE form load and one
             # save. Saving per field would mean two page loads and a window
@@ -849,7 +858,7 @@ def cmd_push_info(args: argparse.Namespace, sheet_path: Path) -> int:
                 # title control, and the two forms share no part of it.
                 written = apply_settings(page, config, course_id,
                                          row.assignment_id, wanted,
-                                         kind=row.kind)
+                                         kind=row.kind, publish=row.publish)
                 # **A write can touch a field the sheet never named**, and then
                 # that field needs the same verification as the ones it did.
                 # A submission-type write can take an attempts limit with it
@@ -857,10 +866,16 @@ def cmd_push_info(args: argparse.Namespace, sheet_path: Path) -> int:
                 # side* -- the form looked correct throughout on 2026-09-13 --
                 # so ENV is the only thing that can say what became of it.
                 touched = side_effects(written)
+                # `published` rides on its own flag rather than in `wanted`,
+                # so it has to be named here or the one field a student sees
+                # would be the one field nothing verifies.
                 got = verify_settings(
                     page, config, course_id, row.assignment_id,
-                    tuple(wanted) + tuple(w.field for w in touched
-                                          if w.field not in wanted))
+                    tuple(wanted)
+                    + (("published",) if row.publish
+                       and "published" not in wanted else ())
+                    + tuple(w.field for w in touched
+                            if w.field not in wanted))
             except (WriteRefused, WriteFailed) as exc:
                 print(f"  REFUSED {row.title}: {exc}", file=sys.stderr)
                 problems.append(f"{row.title} #{row.assignment_id}")
@@ -898,6 +913,24 @@ def cmd_push_info(args: argparse.Namespace, sheet_path: Path) -> int:
                     print(f"      {'':<18}why: {why}", file=sys.stderr)
                     problems.append(
                         f"{row.title} #{row.assignment_id} ({change.field})")
+
+            # **Publishing is reported like any other write, and verified from
+            # ENV.** It is not in `row.changes` -- it is a button, not a field
+            # -- so the loop above cannot print it, which is exactly how
+            # publish-at-create shipped with a silent preview. The value comes
+            # from Canvas rather than from the plan, so "asked to publish and
+            # Canvas still says false" is visible instead of assumed.
+            if row.publish:
+                landed = got.get("published", "")
+                ok = same_value("published", landed, "true")
+                print(f"      {'published':<18}false -> true   Canvas now: "
+                      f"{landed}   {'OK' if ok else 'MISMATCH'}")
+                if not ok:
+                    print(f"      {'':<18}why: the save went through but Canvas "
+                          f"holds {landed!r} -- it was NOT published",
+                          file=sys.stderr)
+                    problems.append(
+                        f"{row.title} #{row.assignment_id} (published)")
 
             # **Said out loud, because nobody asked for it.** A field the sheet
             # never mentioned was touched by the form itself, and silence here

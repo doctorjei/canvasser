@@ -348,16 +348,24 @@ because there is nothing for it to mark.
 
 ### What `push` writes from it
 
-**`points_possible`, `grading_type`, `submission_types`, `allowed_attempts` and
-`peer_reviews` today.** `published` is the one remaining column on an **existing** row,
-reported per row as `NOT WRITABLE YET` and skipped — never silently dropped.
+**`points_possible`, `grading_type`, `submission_types`, `allowed_attempts`,
+`peer_reviews`, and `published` in one direction.** Anything else an editable column can
+express is reported per row as `NOT WRITABLE YET` and skipped — never silently dropped.
 
-**On a `NEW` row, `published` does work**: Canvas offers a "Save & Publish" button beside
-the ordinary Save while an assignment is unpublished, so a new assignment can be created
-already visible to students. Left blank or set to `false`, it is created unpublished, and
-`push` says so for every row it creates. If that button is missing, the create is **refused**
-rather than saved unpublished — a create you asked to publish must not quietly arrive
-invisible.
+**Publishing goes one way, and that is Canvas's limit rather than a missing feature.**
+There is no publish checkbox on an assignment form; Canvas offers a second submit button,
+"Save & Publish", **exactly while an assignment is unpublished**. So:
+
+| | what happens |
+|---|---|
+| `published` blank | left alone |
+| `false -> true` | published, on a `NEW` row and on an existing one |
+| `true -> false` | reported `NOT WRITABLE YET` — no control exists. Unpublish it in Canvas |
+
+A row asking to publish says so explicitly in the preview, and the result is read back from
+Canvas afterwards, because this is the one setting a student notices the moment it changes.
+If the button is missing when it is needed, the write is **refused** rather than saved
+unpublished — asking to publish and quietly not publishing is the failure this refuses.
 
 Each is compared by **meaning rather than text**, so a spreadsheet's reformatting is not
 mistaken for an edit: points numerically (`8.34` = `8.340`), submission types as a set
@@ -459,11 +467,12 @@ NEW,Homework 1,assignment,Exercises,10,points,online_upload,...
 - **Close the file first.** `push` refuses to create anything while your spreadsheet still
   has the sheet open, and re-reads the file after each write-back to confirm the id landed.
   If a spreadsheet saved `NEW` back over a real id, the next push would create a duplicate.
-- **`published` works here and only here.** Set it to `true` and the assignment is created
-  already visible to students, using the "Save & Publish" button Canvas offers while an
-  assignment is unpublished. Blank or `false` creates it unpublished. Either way the preview
-  states which, because that is the one setting a student notices immediately. On a row for
-  an assignment that **already exists**, `published` is still reported `NOT WRITABLE YET`.
+- **`published` works here too.** Set it to `true` and the assignment is created already
+  visible to students, using the "Save & Publish" button Canvas offers while an assignment
+  is unpublished. Blank or `false` creates it unpublished. Either way the preview states
+  which, because that is the one setting a student notices immediately. On an assignment
+  that **already exists**, `false -> true` works the same way; `true -> false` does not,
+  because Canvas offers no control for it.
 - **A new assignment has no dates**, because dates live in the other sheet. Run
   `canvasser pull` afterwards to pick the new rows up, then edit and push the datesheet.
 

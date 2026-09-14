@@ -668,6 +668,18 @@ def render_info_diff(diff, committing: bool = False) -> list[str]:
                 out.append(_paint(
                     "        its points re-scales every student's percentage",
                     BRIGHT_BOLD_RED))
+        if row.publish:
+            # **`publish` is not in `row.changes` and must still be shown.** It
+            # is a button rather than a field, so the loop above cannot see it
+            # -- which is precisely how publish-at-CREATE shipped with a
+            # preview that printed every other field and said nothing about the
+            # one a student sees. Same decision, same blind spot, so the same
+            # explicit line.
+            out.append(
+                f"      {fit('published', 18)}"
+                f"{_paint(fit('false', 14), GREY)}"
+                f" -> {_paint('true', BRIGHT_BOLD_GREEN)}"
+                + _paint("   students will see this", BRIGHT_BOLD_GREEN))
         for message in row.invalid:
             # A value this build understands the column for but cannot use --
             # typically the label a person sees ("Points") where Canvas wants
@@ -719,6 +731,11 @@ def render_info_diff(diff, committing: bool = False) -> list[str]:
     graded = sum(1 for r in diff.changed if r.graded and r.changes)
     out.append(
         f"  {len(diff.changed)} row(s), {diff.field_count} field(s) would change"
+        # Counted apart from the fields, because publishing is a button and not
+        # a field -- and said loudly, because it is the only line here a
+        # student sees the moment it happens.
+        + (_paint(f"; {diff.publish_count} would be PUBLISHED",
+                  BRIGHT_BOLD_GREEN) if diff.publish_count else "")
         + (_paint(f"; {unsupported} edit(s) NOT writable yet", BRIGHT_BOLD_RED)
            if unsupported else "")
         + (_paint(f"; {gated} rename(s) need --rename", BRIGHT_BOLD_RED)

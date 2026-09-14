@@ -1388,6 +1388,7 @@ def apply_settings(
     assignment_id: str,
     changes: dict[str, str],
     kind: str = "",
+    publish: bool = False,
 ) -> list[Written]:
     """Set an assignment's non-date settings and save. **This writes.**
 
@@ -1410,6 +1411,12 @@ def apply_settings(
     and is needed only for `title`, whose control is the one field on this form
     that differs between the two. It defaults to empty so every existing caller
     is unaffected; a `title` change without it refuses rather than guessing.
+
+    `publish` asks for the second submit button instead of the ordinary Save,
+    which is how an existing assignment goes from unpublished to published
+    (built 2026-09-14, to the user's 2026-09-11 decision). It is **not** a
+    `changes` entry, because there is no publish control to type into. It goes
+    one way only: `true -> false` has no control anywhere on this form.
     """
     _open_editor(page, config, course_id, assignment_id)
     refuse_if_discussion(page, assignment_id)
@@ -1452,10 +1459,38 @@ def apply_settings(
         )
     written += _apply_field_values(page, assignment_id, rest)
 
-    save = _save_button(page)
-    if save is None:
-        snapshot = save_debug_snapshot(page, f"no-save-button-{assignment_id}")
-        raise WriteFailed(f"no Save button found on {page.url}. Snapshot: {snapshot}")
+    # **`publish` picks the button, and that is the whole mechanism** -- the
+    # same one creation proved live on 2026-09-11. `published` is not a control
+    # on this form: Canvas offers a second submit, "Save & Publish", exactly
+    # while an assignment is unpublished. So it must never arrive in `changes`,
+    # where `_apply_field_values` would hunt for a widget that does not exist.
+    #
+    # **A missing button REFUSES; it never falls back to the plain Save.** That
+    # fallback reads like graceful degradation and means "asked to publish,
+    # saved everything else, reported success" -- and the field is the one a
+    # student sees the instant it changes. Looked up before anything is
+    # clicked, so the refusal costs a page load rather than a half-done save.
+    #
+    # **`true -> false` never reaches here.** Unpublishing has no control on
+    # this form at all, so `push` reports it as not-writable instead.
+    if publish:
+        save = _save_and_publish_button(page)
+        if save is None:
+            snapshot = save_debug_snapshot(
+                page, f"no-publish-button-{assignment_id}")
+            raise WriteFailed(
+                f"no unambiguous 'Save & Publish' button on {page.url}, so "
+                f"assignment {assignment_id} was NOT published and nothing "
+                f"else was saved either. Canvas offers that button only while "
+                f"an assignment is unpublished -- if this one is already "
+                f"published, remove the `published` cell; otherwise publish it "
+                f"in Canvas. Snapshot: {snapshot}"
+            )
+    else:
+        save = _save_button(page)
+        if save is None:
+            snapshot = save_debug_snapshot(page, f"no-save-button-{assignment_id}")
+            raise WriteFailed(f"no Save button found on {page.url}. Snapshot: {snapshot}")
     save.click()
 
     # Gate 3: Canvas reports a rejected save only on the page. Both signals are
