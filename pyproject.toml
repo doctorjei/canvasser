@@ -39,7 +39,10 @@ classifiers = [
 # browser builds are platform-specific native binaries, so no PyPI package
 # carries them. canvasser offers to fetch Chromium on first use, and
 # `canvasser install-browser` does it up front.
-dependencies = ["playwright>=1.40"]
+# `duo-pass` answers the Duo challenge behind the `Approver` interface; the
+# floor is the release carrying the injectable passcode source. `canvasser/duo.py`
+# is host wiring over it (snapshot/announce hooks), not a second implementation.
+dependencies = ["playwright>=1.40", "duo-pass>=0.0.2"]
 
 [project.urls]
 Homepage = "https://github.com/doctorjei/canvasser"
