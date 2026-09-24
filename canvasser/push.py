@@ -680,8 +680,24 @@ GRADING_TYPES = (
 
 #: Taking an assignment out of the gradebook. Not refused -- it is a real thing
 #: to want -- but it hides the points and dates and is not an accident anyone
-#: should make quietly.
+#: should make quietly. **Said in the preview since 2026-09-24**:
+#: `leaves_gradebook` sets `InfoRowDiff.leaves_gradebook`, which
+#: `display.render_info_diff` annotates on the row and counts in the summary,
+#: and `cli.gradebook_exit_lines` restates at commit.
 NOT_GRADED = "not_graded"
+
+
+def leaves_gradebook(before: str, after: str) -> bool:
+    """Whether a `grading_type` change takes an assignment OUT of the gradebook.
+
+    Only the move *into* `NOT_GRADED` from something else. Already not graded
+    is no change at all, and a blank cell never reaches here (blank means
+    leave alone). **Leaving `NOT_GRADED` is deliberately silent**: it puts an
+    assignment back where every other one already is, which is the ordinary
+    state rather than the surprising one.
+    """
+    return ((after or "").strip() == NOT_GRADED
+            and (before or "").strip() != NOT_GRADED)
 
 
 def check_grading_type(cell: str) -> str | None:
@@ -801,6 +817,15 @@ class InfoRowDiff:
     #: path hunting for a widget, and the field count would claim an edit
     #: nobody asked for.
     attempts_loss: AttemptsLoss | None = None
+    #: True when this row's `grading_type` change is TO `NOT_GRADED`.
+    #:
+    #: **An annotation, not a replacement** -- the opposite of `attempts_loss`
+    #: in one respect: the change IS typed into a control, so it stays in
+    #: `changes` and is written like any other. The flag exists so the preview
+    #: can say what the change *means*, which the `before -> after` line
+    #: cannot: the assignment leaves grade calculations and its points are
+    #: hidden. Not refused -- it is a real thing to want.
+    leaves_gradebook: bool = False
 
 
 @dataclass(frozen=True)
@@ -859,6 +884,16 @@ class InfoDiff:
         a changed field would make "N field(s) would change" untrue.
         """
         return sum(1 for row in self.changed if row.attempts_loss)
+
+    @property
+    def leaves_gradebook_count(self) -> int:
+        """How many rows would take an assignment out of the gradebook.
+
+        Counted in ADDITION to `field_count`, not apart from it: unlike an
+        attempts loss, the grading-type change is a real field and is already
+        in that number. This says what some of those fields mean.
+        """
+        return sum(1 for row in self.changed if row.leaves_gradebook)
 
 
 def same_points(before: str, after: str) -> bool:
@@ -1238,6 +1273,12 @@ def compare_info(
                 if change.field == "submission_types":
                     loss = attempts_at_risk(have.allowed_attempts, change.after)
 
+        # From `changes`, so an invalid or unwritable cell never warns: only a
+        # grading-type change that will actually be written can leave the
+        # gradebook.
+        leaves = any(c.field == "grading_type"
+                     and leaves_gradebook(c.before, c.after) for c in changes)
+
         if changes or unsupported or gated or invalid or publish:
             changed.append(
                 InfoRowDiff(
@@ -1256,6 +1297,7 @@ def compare_info(
                     kind=have.kind,
                     publish=publish,
                     attempts_loss=loss,
+                    leaves_gradebook=leaves,
                 )
             )
 

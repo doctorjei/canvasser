@@ -463,6 +463,16 @@ Changing points on an assignment that **already has graded submissions** re-scal
 student's percentage, so it is called out against the row and again before writing. It is a
 warning, not a refusal — the write proceeds.
 
+Changing `grading_type` **to** `not_graded` is called out the same way — beside the row, in
+the summary, and again before writing — because it takes the assignment out of grade
+calculations and hides its points, and Canvas accepts it without a word:
+
+```
+    grading_type      points         -> not_graded
+    ^ LEAVES THE GRADEBOOK -- 'not_graded' removes this assignment from grade
+      calculations and hides its points; Canvas will not refuse it
+```
+
 ### Creating assignments: put `NEW` in the id cell
 
 Add a row whose `assignment_id` reads `NEW`, give it a `title` and a `submission_types`,

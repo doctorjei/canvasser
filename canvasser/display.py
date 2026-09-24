@@ -25,6 +25,8 @@ from datetime import datetime, timedelta
 from unicodedata import east_asian_width
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .push import NOT_GRADED
+
 # --- colour -----------------------------------------------------------------
 
 RESET = "\033[0m"
@@ -668,6 +670,18 @@ def render_info_diff(diff, committing: bool = False) -> list[str]:
                 out.append(_paint(
                     "        its points re-scales every student's percentage",
                     BRIGHT_BOLD_RED))
+            if row.leaves_gradebook and change.field == "grading_type":
+                # **Beside the change it explains**, not after the row: unlike
+                # `attempts_loss` this IS a field in `row.changes`, so the
+                # `before -> after` line is already printed -- and says nothing
+                # about what `not_graded` does. Not a refusal; Canvas will not
+                # refuse it either, which is the reason to say it here.
+                out.append(_paint(
+                    f"      ^ LEAVES THE GRADEBOOK -- {NOT_GRADED!r} removes "
+                    f"this assignment from grade", BRIGHT_BOLD_RED))
+                out.append(_paint(
+                    "        calculations and hides its points; Canvas will "
+                    "not refuse it", BRIGHT_BOLD_RED))
         if row.attempts_loss:
             # **Said BEFORE the write, not only after it.** The loss was
             # already reported at commit time by `writer._carry_attempts`,
@@ -763,6 +777,10 @@ def render_info_diff(diff, committing: bool = False) -> list[str]:
         # Canvas simply drops what the new submission type cannot hold.
         + (_paint(f"; {diff.attempts_loss_count} would LOSE an attempts limit",
                   BRIGHT_BOLD_RED) if diff.attempts_loss_count else "")
+        # NOT apart from the fields: the grading-type change is one of them.
+        # This names what some of them mean.
+        + (_paint(f"; {diff.leaves_gradebook_count} would LEAVE THE GRADEBOOK",
+                  BRIGHT_BOLD_RED) if diff.leaves_gradebook_count else "")
     )
     return out
 

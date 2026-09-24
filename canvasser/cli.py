@@ -83,6 +83,7 @@ from .display import (
 )
 from .push import (
     FIELD_PAIRS,
+    NOT_GRADED,
     WRITABLE_INFO_FIELDS,
     align_timezone,
     check_course,
@@ -773,6 +774,25 @@ def side_effect_line(side: Written) -> str:
     return f"      {side.field:<18}{side.note}"
 
 
+def gradebook_exit_lines(diff) -> list[str]:
+    """The commit block's restatement of every row leaving the gradebook.
+
+    **Said twice, like the graded-submissions warning**: once beside the row
+    in the preview and again here, where it stops being hypothetical -- a
+    warning in a long preview is easy to scroll past, and this is a change
+    Canvas will not refuse. Pure and out here for the reason
+    `side_effect_line` is: `cmd_push_info` needs a browser, so nothing offline
+    could otherwise see what it prints.
+    """
+    rows = [r for r in diff.changed if r.leaves_gradebook]
+    if not rows:
+        return []
+    return [f"\n  !! {len(rows)} assignment(s) below will be set to "
+            f"{NOT_GRADED!r}. They leave grade calculations and their points "
+            f"are hidden:"] + [
+        f"       {row.title}  #{row.assignment_id}" for row in rows]
+
+
 def side_effect_report(
     touched: Sequence[Written], got: dict[str, str],
 ) -> list[tuple[Written, str, bool]]:
@@ -954,6 +974,9 @@ def cmd_push_info(args: argparse.Namespace, sheet_path: Path) -> int:
             )
             for row in grading_rows:
                 print(f"       {row.title}  #{row.assignment_id}", file=sys.stderr)
+
+        for line in gradebook_exit_lines(diff):
+            print(line, file=sys.stderr)
 
         print()
         problems: list[str] = list(create_problems)
