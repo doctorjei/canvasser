@@ -1,0 +1,99 @@
+# Written by `kinemata init`. Every section below is optional except that the
+# file must declare at least one check -- a config nothing can fail is not a
+# configuration.
+
+[project]
+root = "."
+exclude = ["build/", "dist/", ".venv/"]
+
+# Falsify what the documentation says about this tree: paths that do not exist,
+# links that do not resolve, commits that are not in history. Needs no registry.
+[claims]
+suffixes = [".md"]
+# historical = ["archives/"]   # a record of what was true is not a stale claim
+
+# A claim deferred until a date, which is what stops a deferral from being an
+# ignore list. `path` defers a file the project will produce; `what` defers
+# anything else. Both need `until`.
+#
+# [[promise]]
+# path  = "docs/report.md"
+# until = "2026-12-01"
+
+# A registry is one declared place per fact, and `check` fails on code that
+# re-derives one.
+#
+# `sheet-contract`: the sheet/diff vocabularies — submission modes, grading
+# types, schema versions, the NEW marker. This is the project's own most
+# expensive duplication shape: three spellings of ("none", "on_paper") grew up
+# in three places before NO_SUBMISSION_MODES became the one definition, and a
+# correct submission_types write once reported MISMATCH because three parallel
+# comparison chains had to agree. Antipatterns are derived from the constants
+# themselves.
+[[registry]]
+name = "sheet-contract"
+kind = "python-constants"
+modules = ["canvasser/push.py", "canvasser/infosheet.py", "canvasser/datesheet.py"]
+
+# `sheet-vocabularies`: the TUPLE vocabularies in push.py, which
+# `python-constants` cannot see (it reads string constants only). Hand-declared,
+# as code-patterns entries always are.
+#
+# **An antipattern is two members of one vocabulary adjacent in one literal** --
+# `"none", "on_paper"` -- because that is what a re-spelled set looks like. A
+# single value is a USE (`if mode == "none"`), and a mapping keyed by the values
+# (`writer.ONLINE_TYPE_BOXES`, value -> measured page name) is a table of facts
+# about the page, not a second copy of the set; neither matches.
+#
+# **The declaring line is excluded by NAME, not by `home`, where it can be.**
+# `home` skips its whole file, and two of the three historical spellings of
+# ("none", "on_paper") were in push.py itself -- a home of push.py would have
+# missed both. The two multi-line tuples cannot be excluded by a line pattern
+# (their continuation lines carry no name), so they take `home`, and a
+# re-spelling inside push.py is theirs to miss. Stated, not discovered later.
+[[registry]]
+name = "sheet-vocabularies"
+kind = "code-patterns"
+
+[[registry.entry]]
+id = "NO_SUBMISSION_MODES"
+note = "push.py -- the two modes that accept no submissions"
+antipatterns = [
+  '''^(?!(?:NO_)?SUBMISSION_MODES = ).*["'](?:none|on_paper)["']\s*,\s*["'](?:none|on_paper)["']''',
+]
+
+[[registry.entry]]
+id = "SUBMISSION_MODES"
+note = "push.py -- the Submission Type select's option values"
+# One pattern, not one per order: a pair like ("online", "external_tool")
+# matches both orders' patterns and was reported twice. A pair of none/on_paper
+# alone is left to NO_SUBMISSION_MODES, so it is not reported twice either.
+antipatterns = [
+  '''^(?!SUBMISSION_MODES = ).*(?:["'](?:none|on_paper|online|external_tool)["']\s*,\s*["'](?:online|external_tool)["']|["'](?:online|external_tool)["']\s*,\s*["'](?:none|on_paper)["'])''',
+]
+
+[[registry.entry]]
+id = "ONLINE_SUBMISSION_TYPES"
+note = "push.py -- the five online sub-types ENV reports"
+home = ["canvasser/push.py"]
+antipatterns = [
+  '''["'](?:online_text_entry|online_url|online_upload|media_recording|student_annotation)["']\s*,\s*["'](?:online_text_entry|online_url|online_upload|media_recording|student_annotation)["']''',
+]
+
+[[registry.entry]]
+id = "GRADING_TYPES"
+note = "push.py -- the Display Grade as select's option values"
+home = ["canvasser/push.py"]
+antipatterns = [
+  '''["'](?:points|percent|letter_grade|gpa_scale|pass_fail|not_graded)["']\s*,\s*["'](?:points|percent|letter_grade|gpa_scale|pass_fail|not_graded)["']''',
+]
+#
+# Adopting on a codebase that already fails: run `kinemata baseline --record`
+# once, locally, and commit the file. Never from CI.
+
+# A ceiling on what a session loads. No default: measure what you carry today,
+# declare that, then drive it down.
+#
+# [context]
+# include = ["README.md", "docs/**/*.md"]
+# budget = 0

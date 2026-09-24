@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "until": "2026-12-01",
+  "by": "Jei",
+  "note": "pre-existing at adoption",
+  "findings": [
+    {
+      "registry": "claims",
+      "entry": "claim:path",
+      "antipattern": "storage_state.json",
+      "path": "README.md",
+      "text": "- `storage_state.json` (the saved session) is **credential-equivalent** \u2014 it grants Canvas"
+    }
+  ]
+}

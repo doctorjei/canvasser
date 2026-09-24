@@ -1,0 +1,50 @@
+# Gating canvasser on kinemata: one declared place per fact.
+# Adapted from kinemata's examples/ci-github-actions.yml, pinned to the
+# version this tree was adopted against (0.1.1 — kinemata is 0.x and its
+# interfaces are not settled, so an unpinned install changes what it means
+# without changing what it says).
+#
+# READ THIS BEFORE TRUSTING IT AS A CATCH. A workflow file lives in the repo,
+# so it is still a *reminder* until branch protection names this job as a
+# REQUIRED status check. Without that, a deleted or renamed job passes by
+# never reporting. With it, disappearance blocks — but a job that still exists
+# and checks nothing still passes trivially. See kinemata docs/structure.md §1.
+#
+# ADOPTING ON A CODEBASE THAT ALREADY FAILS: the baseline is already recorded
+# (.kinemata-baseline.json, until 2026-12-01). `check` and `claims` fail only
+# on findings the baseline does not cover. Never run `baseline --record`
+# from CI — it would accept whatever the branch introduced and report success.
+
+name: registry-check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  bypasses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install the checker
+        run: pip install "kinemata==0.1.1"
+
+      # Advisory first, so the log always shows the full picture — including
+      # weak signals and suppressed antipatterns — even when the gate passes.
+      - name: Report (advisory)
+        run: kinemata review --verbose
+
+      # Then the gates. Strong signals only; weak ones never fail a build.
+      - name: Gate on strong bypasses
+        run: kinemata check
+
+      # Documentation is a registry of claims about the tree, and it rots the
+      # same way code does.
+      - name: Gate on documentation claims
+        run: kinemata claims
