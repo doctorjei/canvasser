@@ -669,11 +669,11 @@ def check_submission_types(cell: str) -> str | None:
 #: the value. Typing a label into a value field is a silent no-op that looks
 #: exactly like a successful write.
 #:
-#: Duplicated from `writer.FORM_FIELDS` on purpose: this check runs at diff
-#: time, before a page is ever loaded, so a typo is named in the dry run
-#: instead of costing an edit-page load per row to discover. `writer` still
-#: validates against the page's own options, because this list can go stale and
-#: the page cannot.
+#: Checked here at diff time, before a page is ever loaded, so a typo is named
+#: in the dry run instead of costing an edit-page load per row to discover.
+#: **`writer.FORM_FIELDS` reads this same tuple** rather than spelling its own
+#: (it did until 2026-09-24, found by kinemata). `writer` still validates against
+#: the page's own options, because this list can go stale and the page cannot.
 GRADING_TYPES = (
     "points", "percent", "letter_grade", "gpa_scale", "pass_fail", "not_graded",
 )
@@ -955,7 +955,7 @@ CREATABLE_INFO_FIELDS = tuple(
     # the first clause and be typed into a control that does not exist. Naming
     # it here costs one line and closes that door in advance.
     if c != "published"
-    and (c in WRITABLE_INFO_FIELDS or c in ("assignment_group", "kind"))
+    and (c in WRITABLE_INFO_FIELDS or c in CREATE_ONLY_COLUMNS)
 )
 
 #: The only `kind` a `NEW` row may ask for in this build.

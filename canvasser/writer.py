@@ -86,7 +86,7 @@ from .dateparse import DateFormatError, resolve, zone_of
 # and the one on the write path is the one that decides what a real setting is
 # left as -- the lesson `verify_settings` learned by formatting a value its own
 # way. `push` does not import `writer`, so this direction carries no cycle.
-from .push import NO_SUBMISSION_MODES, parse_flag
+from .push import GRADING_TYPES, NO_SUBMISSION_MODES, parse_flag
 
 #: Labels Canvas gives the three date fields. Stable and meaningful, unlike the
 #: React ids beside them (`Selectable___1`, `Select___2`) which are render-order
@@ -648,8 +648,10 @@ FORM_FIELDS = {
         label="Display Grade as",
         name="grading_type",
         kind="select",
-        values=("points", "percent", "letter_grade", "gpa_scale", "pass_fail",
-                "not_graded"),
+        # `push`'s tuple, not a second spelling of it. The diff-time check and
+        # this field describe one control, and two copies of its option values
+        # can only ever agree by accident.
+        values=GRADING_TYPES,
     ),
     # **Addressed by name and type, because THE ID DIFFERS BETWEEN THE TWO
     # FORMS** -- found by the first live create, 2026-09-10:
@@ -828,11 +830,6 @@ def _attempts_cell(found: dict | None) -> str:
         return "-1"
     return (found.get("box_value") or "").strip()
 
-
-#: Selecting this takes the assignment out of the gradebook entirely and hides
-#: its points and dates. Reported loudly rather than refused -- it is a real
-#: thing a person may want -- but it is not a change to make by accident.
-NOT_GRADED = "not_graded"
 
 _FIELD_PROBE = """(selector) => {
     const all = document.querySelectorAll(selector);
