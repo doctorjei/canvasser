@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .credentials import (
+    NAMES,
     ConfigError,
     parse_env_file,
     resolve_credentials,
@@ -315,6 +316,7 @@ def load_config(
     env_file = env_file or paths.env_file
 
     resolved_user, resolved_pass = resolve_credentials(
+        names=NAMES,
         username=username,
         secrets_file=secrets_file,
         default_file=env_file,

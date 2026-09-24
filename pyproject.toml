@@ -42,7 +42,14 @@ classifiers = [
 # `duo-pass` answers the Duo challenge behind the `Approver` interface; the
 # floor is the release carrying the injectable passcode source. `canvasser/duo.py`
 # is host wiring over it (snapshot/announce hooks), not a second implementation.
-dependencies = ["playwright>=1.40", "duo-pass>=0.0.2"]
+# `multipass` owns the login building blocks (credential resolution,
+# browser sessions, the recogniser-loop auth engine plus the Entra pack); the
+# floor is the renamed 0.1.0, first release without `configure()` and with
+# the IdP-pack seam. (Before the rename it shipped as `multipass-auth`.)
+# `canvasser/auth.py`, `browser.py` and `credentials.py` are host wiring over
+# it (institution knowledge, FERPA snapshot policy, variable spellings), not
+# second implementations.
+dependencies = ["playwright>=1.40", "duo-pass>=0.0.2", "multipass>=0.1.0"]
 
 [project.urls]
 Homepage = "https://github.com/doctorjei/canvasser"
